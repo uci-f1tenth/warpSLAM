@@ -71,8 +71,8 @@ def search(
     y = center[1] + (float(j) - float(n_xy - 1) * 0.5) * step_xy
     θ = center[2] + (float(k) - float(n_theta - 1) * 0.5) * step_theta
 
-    cθ = wp.sin(θ)
-    sθ = wp.cos(θ)
+    cθ = wp.cos(θ)
+    sθ = wp.sin(θ)
     ct = cos_table[b]
     st = sin_table[b]
     ca = ct * cθ - st * sθ
@@ -121,7 +121,7 @@ def integrate(ranges: wp.array[float], pose: wp.vec3, logodds: wp.array2d[float]
     ix = int(x1)
     iy = int(y1)
     if 0 <= ix < GRID_WIDTH and 0 <= iy < GRID_HEIGHT:
-        wp.atomic_add(logodds, iy, ix, L_FREE)
+        wp.atomic_add(logodds, iy, ix, L_OCC - L_FREE)
 
 
 @wp.kernel
@@ -153,10 +153,12 @@ class Bridge:
         self.likelihood = wp.zeros((GRID_HEIGHT, GRID_WIDTH))
         self.ranges = wp.zeros(LIDAR_POINTS)
 
-        a = np.linspace(-LIDAR_FOV * 0.5, LIDAR_FOV * 0.5, LIDAR_POINTS)
+        step = LIDAR_FOV / LIDAR_POINTS
+        a = -LIDAR_FOV * 0.5 + step * BEAM_STRIDE * np.arange(
+            NUM_MATCH_BEAMS, dtype=np.float32
+        )
         self.sin_table = wp.array(np.sin(a))
         self.cos_table = wp.array(np.cos(a))
-
         max_c = 0
         for hxy, hth, sxy, sth in self.stages:
             n_xy = int(2 * hxy / sxy) + 1
@@ -182,6 +184,8 @@ class Bridge:
         self.last_kf = self.pose.copy()
 
     def match(self, seed):
+        p = seed.astype(np.float32)
+
         for hxy, hth, sxy, sth in self.stages:
             n_xy = int(2 * hxy / sxy) + 1
             n_theta = int(2 * hth / sth) + 1
@@ -196,7 +200,7 @@ class Bridge:
                     self.sin_table,
                     self.cos_table,
                     self.likelihood,
-                    wp.vec3(*seed),
+                    wp.vec3(*p),
                     sxy,
                     sth,
                     n_xy,
@@ -205,30 +209,32 @@ class Bridge:
                 ],
             )
 
-        best = int(self.scores.numpy()[:count].argmax())
-        i = best // (n_xy * n_theta)
-        j = (best // n_theta) % n_xy
-        k = best % n_theta
-        p = np.array(
-            [
-                seed[0] + (i - (n_xy - 1) * 0.5) * sxy,
-                seed[1] + (j - (n_xy - 1) * 0.5) * sxy,
-                seed[2] + (k - (n_theta - 1) * 0.5) * sth,
-            ],
-        )
+            best = int(self.scores.numpy()[:count].argmax())
+            i = best // (n_xy * n_theta)
+            j = (best // n_theta) % n_xy
+            k = best % n_theta
+            p = np.array(
+                [
+                    p[0] + (i - (n_xy - 1) * 0.5) * sxy,
+                    p[1] + (j - (n_xy - 1) * 0.5) * sxy,
+                    p[2] + (k - (n_theta - 1) * 0.5) * sth,
+                ],
+                dtype=np.float32,
+            )
+
         return p
 
     def step(self, ranges_np, odom_delta):
         with wp.ScopedTimer("step"):
-            wp.copy(self.ranges, wp.array(ranges_np))
+            wp.copy(self.ranges, wp.array(ranges_np.astype(np.float32)))
 
             if self.first:
-                self.pose = odom_delta
+                self.pose = odom_delta.astype(np.float32)
                 self.first = False
                 self.integrate_scan()
                 return self.pose
 
-            seed = self.pose + odom_delta
+            seed = self.pose + odom_delta.astype(np.float32)
             self.pose = self.match(seed)
 
             d = self.pose - self.last_kf
