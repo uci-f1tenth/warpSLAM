@@ -69,7 +69,7 @@ def search(
     total = float(0.0)
     for b in range(NUM_MATCH_BEAMS):
         r = ranges[b * BEAM_STRIDE]
-        if not RANGE_MIN <= r <= RANGE_MAX:
+        if not (RANGE_MIN <= r < RANGE_MAX):
             continue
         ct = cos_table[b]
         st = sin_table[b]
@@ -87,7 +87,7 @@ def integrate(ranges: wp.array[float], pose: wp.vec3, logodds: wp.array2d[float]
     i = wp.tid()
     r = ranges[i]
 
-    if not RANGE_MIN <= r <= RANGE_MAX:
+    if not (RANGE_MIN <= r < RANGE_MAX):
         return
 
     a = LIDAR_MIN_ANGLE + LIDAR_INCREMENT * float(i) + pose[2]
@@ -119,6 +119,12 @@ def integrate(ranges: wp.array[float], pose: wp.vec3, logodds: wp.array2d[float]
     iy = int(y1)
     if 0 <= ix < GRID_WIDTH and 0 <= iy < GRID_HEIGHT:
         wp.atomic_add(logodds, iy, ix, L_OCC - L_FREE)
+
+
+@wp.kernel
+def clamp_logodds(logodds: wp.array2d[float]):
+    x, y = wp.tid()
+    logodds[y, x] = wp.clamp(logodds[y, x], L_MIN, L_MAX)
 
 
 @wp.kernel
@@ -176,6 +182,11 @@ class Bridge:
             integrate,
             dim=LIDAR_POINTS,
             inputs=[self.ranges, wp.vec3(*self.pose), self.logodds],
+        )
+        wp.launch(
+            clamp_logodds,
+            dim=(int(GRID_WIDTH), int(GRID_HEIGHT)),
+            inputs=[self.logodds],
         )
         wp.launch(
             blur,
@@ -248,7 +259,7 @@ class Bridge:
                 return self.pose
 
             seed = self.pose + odom_delta.astype(np.float32)
-            hit = (ranges_np >= float(RANGE_MIN)) & (ranges_np <= float(RANGE_MAX))
+            hit = (ranges_np >= float(RANGE_MIN)) & (ranges_np < float(RANGE_MAX))
             if not np.any(hit):
                 self.pose = seed
                 return self.pose
@@ -284,26 +295,32 @@ if __name__ == "__main__":
 
     LIDAR_POINTS_I = int(LIDAR_POINTS)
     LIDAR_STEP = float(LIDAR_FOV) / LIDAR_POINTS_I
-    WALL_X = 3.0
-    WALL_Y = 2.0
     R_MIN = float(RANGE_MIN)
     R_MAX = float(RANGE_MAX)
-
     LIDAR_MIN_ANGLE_VAL = float(LIDAR_MIN_ANGLE)
 
-    def generate_scan(pos_x):
+    ROOM_X_MIN, ROOM_X_MAX = -2.0, 20.0
+    ROOM_Y_MIN, ROOM_Y_MAX = -3.0, 3.0
+
+    def generate_scan(pos_x, pos_y=0.0):
         angles = LIDAR_MIN_ANGLE_VAL + LIDAR_STEP * np.arange(LIDAR_POINTS_I)
         ca = np.cos(angles)
         sa = np.sin(angles)
-        t = np.full(LIDAR_POINTS_I, R_MAX, dtype=np.float32)
+        eps = 1e-6
 
-        fwd = ca > 1e-6
-        t[fwd] = np.minimum(t[fwd], (WALL_X - pos_x) / ca[fwd])
+        t = np.full(LIDAR_POINTS_I, np.inf, dtype=np.float32)
 
-        left = sa > 1e-6
-        t[left] = np.minimum(t[left], WALL_Y / sa[left])
+        m = ca > eps
+        t[m] = np.minimum(t[m], (ROOM_X_MAX - pos_x) / ca[m])
+        m = ca < -eps
+        t[m] = np.minimum(t[m], (ROOM_X_MIN - pos_x) / ca[m])
+        m = sa > eps
+        t[m] = np.minimum(t[m], (ROOM_Y_MAX - pos_y) / sa[m])
+        m = sa < -eps
+        t[m] = np.minimum(t[m], (ROOM_Y_MIN - pos_y) / sa[m])
 
-        t[t < R_MIN] = R_MAX
+        bad = (t < R_MIN) | (t >= R_MAX) | ~np.isfinite(t)
+        t[bad] = 0.0
         return t
 
     with wp.ScopedDevice(args.device):
