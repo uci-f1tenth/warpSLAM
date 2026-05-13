@@ -24,6 +24,7 @@ BEAM_STRIDE = wp.constant(8)
 LIDAR_MIN_ANGLE = wp.constant(-LIDAR_FOV * 0.5)
 LIDAR_INCREMENT = wp.constant(LIDAR_FOV / LIDAR_POINTS)
 NUM_MATCH_BEAMS = wp.constant(LIDAR_POINTS // BEAM_STRIDE)
+INV_9 = wp.constant(1.0 / 9.0)
 
 
 @wp.func
@@ -37,13 +38,10 @@ def lookup_float(f: wp.array2d[float], x: int, y: int):
 def sample_float(f: wp.array2d[float], x: float, y: float):
     lx = int(wp.floor(x))
     ly = int(wp.floor(y))
-
     tx = x - float(lx)
     ty = y - float(ly)
-
     s0 = wp.lerp(lookup_float(f, lx, ly), lookup_float(f, lx + 1, ly), tx)
     s1 = wp.lerp(lookup_float(f, lx, ly + 1), lookup_float(f, lx + 1, ly + 1), tx)
-
     s = wp.lerp(s0, s1, ty)
     return s
 
@@ -61,28 +59,27 @@ def search(
     n_theta: int,
     scores: wp.array[float],
 ):
-    i, j, k, b = wp.tid()
-
-    r = ranges[b * BEAM_STRIDE]
-    if not RANGE_MIN <= r <= RANGE_MAX:
-        return
-
+    i, j, k = wp.tid()
     x = center[0] + (float(i) - float(n_xy - 1) * 0.5) * step_xy
     y = center[1] + (float(j) - float(n_xy - 1) * 0.5) * step_xy
     θ = center[2] + (float(k) - float(n_theta - 1) * 0.5) * step_theta
-
     cθ = wp.cos(θ)
     sθ = wp.sin(θ)
-    ct = cos_table[b]
-    st = sin_table[b]
-    ca = ct * cθ - st * sθ
-    sa = st * cθ + ct * sθ
 
-    gx = (x + r * ca - ORIGIN[0]) * INV_RESOLUTION
-    gy = (y + r * sa - ORIGIN[1]) * INV_RESOLUTION
+    total = float(0.0)
+    for b in range(int(NUM_MATCH_BEAMS)):
+        r = ranges[b * BEAM_STRIDE]
+        if not RANGE_MIN <= r <= RANGE_MAX:
+            continue
+        ct = cos_table[b]
+        st = sin_table[b]
+        ca = ct * cθ - st * sθ
+        sa = st * cθ + ct * sθ
+        gx = (x + r * ca - ORIGIN[0]) * INV_RESOLUTION
+        gy = (y + r * sa - ORIGIN[1]) * INV_RESOLUTION
+        total += sample_float(likelihood, gx, gy)
 
-    c = i * n_xy * n_theta + j * n_theta + k
-    wp.atomic_add(scores, c, sample_float(likelihood, gx, gy))
+    scores[i * n_xy * n_theta + j * n_theta + k] = total
 
 
 @wp.kernel
@@ -134,10 +131,9 @@ def blur(logodds: wp.array2d[float], likelihood: wp.array2d[float]):
     s = 0.0
     for dy in range(-1, 2):
         for dx in range(-1, 2):
-            v = wp.clamp(logodds[y + dy, x + dx], L_MIN, L_MAX)
-            s += wp.max(0.0, v)
+            s += wp.clamp(logodds[y + dy, x + dx], 0.0, L_MAX)
 
-    likelihood[y, x] = s * (1.0 / 9.0)
+    likelihood[y, x] = s * INV_9
 
 
 class Bridge:
@@ -152,6 +148,7 @@ class Bridge:
         self.logodds = wp.zeros((GRID_HEIGHT, GRID_WIDTH))
         self.likelihood = wp.zeros((GRID_HEIGHT, GRID_WIDTH))
         self.ranges = wp.zeros(LIDAR_POINTS)
+        self._ranges_buf = np.empty(int(LIDAR_POINTS), dtype=np.float32)
 
         step = LIDAR_FOV / LIDAR_POINTS
         a = -LIDAR_FOV * 0.5 + step * BEAM_STRIDE * np.arange(
@@ -194,7 +191,7 @@ class Bridge:
             self.scores.zero_()
             wp.launch(
                 search,
-                dim=(n_xy, n_xy, n_theta, NUM_MATCH_BEAMS),
+                dim=(n_xy, n_xy, n_theta),
                 inputs=[
                     self.ranges,
                     self.sin_table,
@@ -226,7 +223,8 @@ class Bridge:
 
     def step(self, ranges_np, odom_delta):
         with wp.ScopedTimer("step"):
-            wp.copy(self.ranges, wp.array(ranges_np.astype(np.float32)))
+            self._ranges_buf[:] = ranges_np
+            self.ranges.assign(self._ranges_buf)
 
             if self.first:
                 self.pose = odom_delta.astype(np.float32)
