@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 import numpy as np
+import warp as wp
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import OccupancyGrid
@@ -13,6 +14,7 @@ class SlamNode(Node):
     def __init__(self):
         super().__init__("slam_node")
 
+        wp.init()
         self.bridge = slam.Bridge()
 
         self.scan_sub = self.create_subscription(
@@ -38,8 +40,8 @@ class SlamNode(Node):
         else:
             odom_delta = self.pose - self.prev_pose
 
-        self.pose = self.bridge.step(ranges, odom_delta)
         self.prev_pose = self.pose.copy()
+        self.pose = self.bridge.step(ranges, odom_delta)
 
     def publish_map(self):
         msg = OccupancyGrid()

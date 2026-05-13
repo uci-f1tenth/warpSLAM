@@ -67,7 +67,7 @@ def search(
     sθ = wp.sin(θ)
 
     total = float(0.0)
-    for b in range(int(NUM_MATCH_BEAMS)):
+    for b in range(NUM_MATCH_BEAMS):
         r = ranges[b * BEAM_STRIDE]
         if not RANGE_MIN <= r <= RANGE_MAX:
             continue
@@ -138,6 +138,7 @@ def blur(logodds: wp.array2d[float], likelihood: wp.array2d[float]):
 
 class Bridge:
     def __init__(self):
+        wp.init()
         self.stages = [
             (0.30, wp.radians(15.0), 0.05, wp.radians(1.0)),
             (0.05, wp.radians(2.0), 0.01, wp.radians(0.2)),
@@ -166,6 +167,9 @@ class Bridge:
         self.pose = np.zeros(3, dtype=np.float32)
         self.last_kf = self.pose.copy()
         self.first = True
+        self._last_score = 0.0
+        self._last_n_valid = 0
+        self._last_spread = 0.0
 
     def integrate_scan(self):
         wp.launch(
@@ -183,7 +187,7 @@ class Bridge:
     def match(self, seed):
         p = seed.astype(np.float32)
 
-        for hxy, hth, sxy, sth in self.stages:
+        for stage_idx, (hxy, hth, sxy, sth) in enumerate(self.stages):
             n_xy = int(2 * hxy / sxy) + 1
             n_theta = int(2 * hth / sth) + 1
             count = n_xy * n_xy * n_theta
@@ -206,7 +210,8 @@ class Bridge:
                 ],
             )
 
-            best = int(self.scores.numpy()[:count].argmax())
+            scores_np = self.scores.numpy()[:count]
+            best = int(scores_np.argmax())
             i = best // (n_xy * n_theta)
             j = (best // n_theta) % n_xy
             k = best % n_theta
@@ -218,6 +223,16 @@ class Bridge:
                 ],
                 dtype=np.float32,
             )
+
+            if stage_idx == len(self.stages) - 1:
+                self._last_score = float(scores_np[best])
+                nonzero = scores_np[scores_np > 0.0]
+                self._last_n_valid = int(nonzero.size)
+                self._last_spread = (
+                    self._last_score - float(np.median(nonzero))
+                    if nonzero.size > 0
+                    else 0.0
+                )
 
         return p
 
@@ -233,6 +248,11 @@ class Bridge:
                 return self.pose
 
             seed = self.pose + odom_delta.astype(np.float32)
+            hit = (ranges_np >= float(RANGE_MIN)) & (ranges_np <= float(RANGE_MAX))
+            if not np.any(hit):
+                self.pose = seed
+                return self.pose
+
             self.pose = self.match(seed)
 
             d = self.pose - self.last_kf
@@ -262,35 +282,85 @@ if __name__ == "__main__":
 
     args = parser.parse_known_args()[0]
 
+    LIDAR_POINTS_I = int(LIDAR_POINTS)
+    LIDAR_STEP = float(LIDAR_FOV) / LIDAR_POINTS_I
+    WALL_X = 3.0
+    WALL_Y = 2.0
+    R_MIN = float(RANGE_MIN)
+    R_MAX = float(RANGE_MAX)
+
+    LIDAR_MIN_ANGLE_VAL = float(LIDAR_MIN_ANGLE)
+
+    def generate_scan(pos_x):
+        angles = LIDAR_MIN_ANGLE_VAL + LIDAR_STEP * np.arange(LIDAR_POINTS_I)
+        ca = np.cos(angles)
+        sa = np.sin(angles)
+        t = np.full(LIDAR_POINTS_I, R_MAX, dtype=np.float32)
+
+        fwd = ca > 1e-6
+        t[fwd] = np.minimum(t[fwd], (WALL_X - pos_x) / ca[fwd])
+
+        left = sa > 1e-6
+        t[left] = np.minimum(t[left], WALL_Y / sa[left])
+
+        t[t < R_MIN] = R_MAX
+        return t
+
     with wp.ScopedDevice(args.device):
         bridge = Bridge()
 
-        # synthetic stand-in scan + zero odom delta; replace with ROS callbacks on the car
-        fake_ranges = np.full(int(LIDAR_POINTS), 5.0, dtype=np.float32)
-        fake_odom = np.zeros(3, dtype=np.float32)
+        fake_odom = np.array([0.05, 0.0, 0.0], dtype=np.float32)
 
         if args.headless:
-            for _ in range(args.num_frames):
+            for frame in range(args.num_frames):
+                fake_ranges = generate_scan((1 + frame) * 0.05)
                 bridge.step(fake_ranges, fake_odom)
         else:
             import matplotlib
             import matplotlib.animation as anim
             import matplotlib.pyplot as plt
 
-            fig = plt.figure()
+            fig, (ax_map, ax_info) = plt.subplots(1, 2, figsize=(14, 6))
 
-            img = plt.imshow(
+            img = ax_map.imshow(
                 bridge.likelihood.numpy(),
                 origin="lower",
                 animated=True,
                 interpolation="antialiased",
             )
             img.set_norm(matplotlib.colors.Normalize(0.0, float(L_MAX)))
+            ax_map.set_title("Likelihood Map")
 
-            def step_and_render(frame_num, img):
+            ax_info.set_xlim(0, 300)
+            ax_info.set_ylim(0, 675)
+            ax_info.set_xlabel("Frame")
+            ax_info.set_ylabel("Score")
+            (line_score,) = ax_info.plot([], [], label="match score")
+            (line_spread,) = ax_info.plot([], [], label="score spread")
+            ax_info.legend()
+
+            frame_buf = []
+            score_buf = []
+            spread_buf = []
+
+            def step_and_render(frame_num, _img):
+                fake_ranges = generate_scan((1 + frame_num) * 0.05)
                 bridge.step(fake_ranges, fake_odom)
-                img.set_array(bridge.likelihood.numpy())
-                return (img,)
+                _img.set_array(bridge.likelihood.numpy())
+
+                frame_buf.append(frame_num)
+                score_buf.append(bridge._last_score)
+                spread_buf.append(bridge._last_spread)
+                if len(frame_buf) > 300:
+                    frame_buf.pop(0)
+                    score_buf.pop(0)
+                    spread_buf.pop(0)
+                line_score.set_data(frame_buf, score_buf)
+                line_spread.set_data(frame_buf, spread_buf)
+                ax_info.relim()
+                ax_info.autoscale_view()
+
+                return (_img, line_score, line_spread)
 
             seq = anim.FuncAnimation(
                 fig,
