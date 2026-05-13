@@ -17,9 +17,9 @@ L_MAX = wp.constant(5.0)
 
 # lidar
 LIDAR_FOV = wp.constant(wp.radians(270.0))
-LIDAR_POINTS = wp.constant(1081)
-RANGE_MIN = wp.constant(0.1)
-RANGE_MAX = wp.constant(20.0)
+LIDAR_POINTS = wp.constant(1080)
+RANGE_MIN = wp.constant(0.06)
+RANGE_MAX = wp.constant(10.0)
 BEAM_STRIDE = wp.constant(8)
 LIDAR_MIN_ANGLE = wp.constant(-LIDAR_FOV * 0.5)
 LIDAR_INCREMENT = wp.constant(LIDAR_FOV / LIDAR_POINTS)
