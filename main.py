@@ -122,14 +122,10 @@ def integrate(ranges: wp.array[float], pose: wp.vec3, logodds: wp.array2d[float]
 
 
 @wp.kernel
-def clamp_logodds(logodds: wp.array2d[float]):
-    x, y = wp.tid()
-    logodds[y, x] = wp.clamp(logodds[y, x], L_MIN, L_MAX)
-
-
-@wp.kernel
 def blur(logodds: wp.array2d[float], likelihood: wp.array2d[float]):
     x, y = wp.tid()
+
+    logodds[y, x] = wp.clamp(logodds[y, x], L_MIN, L_MAX)
 
     if not (1 <= x < GRID_WIDTH - 1 and 1 <= y < GRID_HEIGHT - 1):
         return
@@ -184,11 +180,6 @@ class Bridge:
             inputs=[self.ranges, wp.vec3(*self.pose), self.logodds],
         )
         wp.launch(
-            clamp_logodds,
-            dim=(int(GRID_WIDTH), int(GRID_HEIGHT)),
-            inputs=[self.logodds],
-        )
-        wp.launch(
             blur,
             dim=(int(GRID_WIDTH), int(GRID_HEIGHT)),
             inputs=[self.logodds, self.likelihood],
@@ -203,7 +194,6 @@ class Bridge:
             n_theta = int(2 * hth / sth) + 1
             count = n_xy * n_xy * n_theta
 
-            self.scores.zero_()
             wp.launch(
                 search,
                 dim=(n_xy, n_xy, n_theta),
