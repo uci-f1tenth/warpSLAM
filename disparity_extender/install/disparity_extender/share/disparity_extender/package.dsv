@@ -1,0 +1,6 @@
+source;share/disparity_extender/hook/pythonpath.ps1
+source;share/disparity_extender/hook/pythonpath.dsv
+source;share/disparity_extender/hook/pythonpath.sh
+source;share/disparity_extender/hook/ament_prefix_path.ps1
+source;share/disparity_extender/hook/ament_prefix_path.dsv
+source;share/disparity_extender/hook/ament_prefix_path.sh

@@ -19,11 +19,16 @@ from tf2_ros import TransformBroadcaster
 import slam
 
 
-def yaw_from_quat(q) -> float:
-    return math.atan2(
-        2.0 * (q.w * q.z + q.x * q.y),
-        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-    )
+def euler_from_quat(x, y, z, w):
+    t0 = 2.0 * (w * x + y * z)
+    t1 = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(t0, t1)
+    t2 = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+    pitch = math.asin(t2)
+    t3 = 2.0 * (w * z + x * y)
+    t4 = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(t3, t4)
+    return roll, pitch, yaw
 
 
 def wrap_to_pi(a: float) -> float:
@@ -33,15 +38,17 @@ def wrap_to_pi(a: float) -> float:
 class SlamNode(Node):
     def __init__(self):
         super().__init__("slam_node")
-        self.bridge = slam.Bridge()  # Bridge.__init__ already calls wp.init()
+        self.bridge = slam.Bridge()
 
-        # --- Parameters -----------------------------------------------------
         self.declare_parameter("scan_topic", "/autodrive/roboracer_1/lidar")
         self.declare_parameter("odom_topic", "/autodrive/roboracer_1/odom")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("map_publish_period_s", 1.0)
         self.declare_parameter("publish_tf", True)
+        self.declare_parameter("lidar_height", 0.3)
+        self.declare_parameter("filter_ground", True)
+        self.declare_parameter("ground_filter_margin", 0.15)
 
         scan_topic = self.get_parameter("scan_topic").value
         odom_topic = self.get_parameter("odom_topic").value
@@ -49,6 +56,9 @@ class SlamNode(Node):
         self.base_frame = self.get_parameter("base_frame").value
         map_period = float(self.get_parameter("map_publish_period_s").value)
         self.publish_tf_flag = bool(self.get_parameter("publish_tf").value)
+        self._lidar_height = float(self.get_parameter("lidar_height").value)
+        self._filter_ground = bool(self.get_parameter("filter_ground").value)
+        self._ground_margin = float(self.get_parameter("ground_filter_margin").value)
 
         self.scan_sub = self.create_subscription(
             LaserScan, scan_topic, self.scan_callback, qos_profile_sensor_data
@@ -68,24 +78,35 @@ class SlamNode(Node):
 
         self.map_timer = self.create_timer(map_period, self.publish_map)
 
-        self.pose = np.zeros(3, dtype=np.float32)  # SLAM pose in map frame
-        self.latest_odom = None  # latest odom reading
-        self.prev_odom_at_scan = None  # odom at the previous scan
+        self.pose = np.zeros(3, dtype=np.float32)
+        self.latest_odom = None
+        self.prev_odom_at_scan = None
+        self._odom_has_orientation = None
 
         self._map_data = np.full(
             int(slam.GRID_WIDTH) * int(slam.GRID_HEIGHT), -1, dtype=np.int8
         )
 
-        self.get_logger().info(f"slam_node ready  scan={scan_topic}  odom={odom_topic}")
+        self.get_logger().info(
+            f"slam_node ready  scan={scan_topic}  odom={odom_topic}"
+            f"  lidar_height={self._lidar_height}m  filter_ground={self._filter_ground}"
+        )
 
     def odom_callback(self, msg: Odometry):
         p = msg.pose.pose
+        q = p.orientation
+        roll, pitch, yaw = euler_from_quat(q.x, q.y, q.z, q.w)
+        if not self._odom_has_orientation:
+            if abs(roll) > 1e-4 or abs(pitch) > 1e-4:
+                self._odom_has_orientation = True
+                self.get_logger().info(
+                    f"odom provides orientation  roll={math.degrees(roll):.1f}°"
+                    f"  pitch={math.degrees(pitch):.1f}°"
+                )
         self.latest_odom = np.array(
-            [p.position.x, p.position.y, yaw_from_quat(p.orientation)],
-            dtype=np.float32,
+            [p.position.x, p.position.y, yaw, roll, pitch], dtype=np.float32
         )
 
-    # --------------------------------------------------------------- scan ---
     def scan_callback(self, msg: LaserScan):
         ranges = np.asarray(msg.ranges, dtype=np.float32)
         np.nan_to_num(ranges, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
@@ -111,8 +132,23 @@ class SlamNode(Node):
             self.latest_odom.copy() if self.latest_odom is not None else None
         )
 
-        self.pose = self.bridge.step(ranges, odom_delta)
+        if self._filter_ground and self.latest_odom is not None:
+            roll = float(self.latest_odom[3])
+            pitch = float(self.latest_odom[4])
+            if abs(roll) > 0.001 or abs(pitch) > 0.001:
+                a_min = float(msg.angle_min)
+                a_inc = float(msg.angle_increment)
+                n = len(ranges)
+                angles = a_min + a_inc * np.arange(n)
+                cos_a = np.cos(angles)
+                sin_a = np.sin(angles)
+                z_dir = -cos_a * pitch + sin_a * roll
+                downward = z_dir < -1e-6
+                d_ground = np.full(n, np.inf, dtype=np.float32)
+                d_ground[downward] = self._lidar_height / (-z_dir[downward])
+                ranges[downward & (ranges >= (1.0 - self._ground_margin) * d_ground)] = 0.0
 
+        self.pose = self.bridge.step(ranges, odom_delta)
         self._publish_pose_and_tf(msg.header.stamp)
 
     def _publish_pose_and_tf(self, stamp):
@@ -142,7 +178,6 @@ class SlamNode(Node):
             tf.transform.rotation.w = qw
             self.tf_bcast.sendTransform(tf)
 
-    # ---------------------------------------------------------- map out ---
     def publish_map(self):
         msg = OccupancyGrid()
         now = self.get_clock().now().to_msg()
@@ -157,7 +192,7 @@ class SlamNode(Node):
 
         lo = self.bridge.logodds.numpy().ravel()
         data = self._map_data
-        data.fill(-1)  # default: unknown
+        data.fill(-1)
         known = np.abs(lo) > 0.1
         if known.any():
             p = 1.0 / (1.0 + np.exp(-np.clip(lo[known], -10.0, 10.0)))
