@@ -81,11 +81,26 @@ class SlamNode(Node):
         self.pose = np.zeros(3, dtype=np.float32)
         self.latest_odom = None
         self.prev_odom_at_scan = None
-        self._odom_has_orientation = None
+        self._odom_has_orientation = False
 
-        self._map_data = np.full(
-            int(slam.GRID_WIDTH) * int(slam.GRID_HEIGHT), -1, dtype=np.int8
-        )
+        gw, gh = int(slam.GRID_W), int(slam.GRID_H)
+        self._map_data = np.full(gw * gh, -1, dtype=np.int8)
+        self._map_msg = OccupancyGrid()
+        self._map_msg.info.resolution = float(slam.RES)
+        self._map_msg.info.width = gw
+        self._map_msg.info.height = gh
+        self._map_msg.info.origin.position.x = float(slam.OX)
+        self._map_msg.info.origin.position.y = float(slam.OY)
+        self._map_msg.info.origin.orientation.w = 1.0
+
+        self._ps_msg = PoseStamped()
+        self._ps_msg.header.frame_id = self.map_frame
+        self._tf_msg = TransformStamped()
+        self._tf_msg.header.frame_id = self.map_frame
+        self._tf_msg.child_frame_id = self.base_frame
+
+        self._gf_cache = None  # (n, a_min, a_inc, cos_a, sin_a)
+        self._last_kf_pose = None
 
         self.get_logger().info(
             f"slam_node ready  scan={scan_topic}  odom={odom_topic}"
@@ -108,7 +123,7 @@ class SlamNode(Node):
         )
 
     def scan_callback(self, msg: LaserScan):
-        ranges = np.asarray(msg.ranges, dtype=np.float32)
+        ranges = np.asarray(msg.ranges, dtype=np.float32).copy()
         np.nan_to_num(ranges, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.latest_odom is not None and self.prev_odom_at_scan is not None:
@@ -136,17 +151,21 @@ class SlamNode(Node):
             roll = float(self.latest_odom[3])
             pitch = float(self.latest_odom[4])
             if abs(roll) > 0.001 or abs(pitch) > 0.001:
+                n = len(ranges)
                 a_min = float(msg.angle_min)
                 a_inc = float(msg.angle_increment)
-                n = len(ranges)
-                angles = a_min + a_inc * np.arange(n)
-                cos_a = np.cos(angles)
-                sin_a = np.sin(angles)
+                c = self._gf_cache
+                if c is None or c[0] != n or c[1] != a_min or c[2] != a_inc:
+                    angles = a_min + a_inc * np.arange(n, dtype=np.float32)
+                    self._gf_cache = (n, a_min, a_inc, np.cos(angles), np.sin(angles))
+                _, _, _, cos_a, sin_a = self._gf_cache
                 z_dir = -cos_a * pitch + sin_a * roll
                 downward = z_dir < -1e-6
-                d_ground = np.full(n, np.inf, dtype=np.float32)
-                d_ground[downward] = self._lidar_height / (-z_dir[downward])
-                ranges[downward & (ranges >= (1.0 - self._ground_margin) * d_ground)] = 0.0
+                if downward.any():
+                    d_ground = self._lidar_height / (-z_dir[downward])
+                    rd = ranges[downward]
+                    rd[rd >= (1.0 - self._ground_margin) * d_ground] = 0.0
+                    ranges[downward] = rd
 
         self.pose = self.bridge.step(ranges, odom_delta)
         self._publish_pose_and_tf(msg.header.stamp)
@@ -158,9 +177,8 @@ class SlamNode(Node):
         qz = math.sin(yaw * 0.5)
         qw = math.cos(yaw * 0.5)
 
-        ps = PoseStamped()
+        ps = self._ps_msg
         ps.header.stamp = stamp
-        ps.header.frame_id = self.map_frame
         ps.pose.position.x = x
         ps.pose.position.y = y
         ps.pose.orientation.z = qz
@@ -168,10 +186,8 @@ class SlamNode(Node):
         self.pose_pub.publish(ps)
 
         if self.tf_bcast is not None:
-            tf = TransformStamped()
+            tf = self._tf_msg
             tf.header.stamp = stamp
-            tf.header.frame_id = self.map_frame
-            tf.child_frame_id = self.base_frame
             tf.transform.translation.x = x
             tf.transform.translation.y = y
             tf.transform.rotation.z = qz
@@ -179,16 +195,16 @@ class SlamNode(Node):
             self.tf_bcast.sendTransform(tf)
 
     def publish_map(self):
-        msg = OccupancyGrid()
+        kf = tuple(self.bridge._kf.tolist())
+        if self._last_kf_pose == kf:
+            return
+        self._last_kf_pose = kf
+
         now = self.get_clock().now().to_msg()
-        msg.header = Header(stamp=now, frame_id=self.map_frame)
+        msg = self._map_msg
+        msg.header.stamp = now
+        msg.header.frame_id = self.map_frame
         msg.info.map_load_time = now
-        msg.info.resolution = float(slam.RESOLUTION)
-        msg.info.width = int(slam.GRID_WIDTH)
-        msg.info.height = int(slam.GRID_HEIGHT)
-        msg.info.origin.position.x = float(slam.ORIGIN[0])
-        msg.info.origin.position.y = float(slam.ORIGIN[1])
-        msg.info.origin.orientation.w = 1.0
 
         lo = self.bridge.logodds.numpy().ravel()
         data = self._map_data

@@ -8,15 +8,12 @@ RES = wp.constant(0.05)
 INV_RES = wp.constant(20.0)
 OX = wp.constant(-51.2)
 OY = wp.constant(-51.2)
-GRID_WIDTH = GRID_W
-GRID_HEIGHT = GRID_H
-RESOLUTION = RES
-ORIGIN = (OX, OY)
 
 L_OCC = wp.constant(0.85)
 L_FREE = wp.constant(-0.4)
 L_MIN = wp.constant(-5.0)
 L_MAX = wp.constant(5.0)
+L_SPLAT = wp.constant(0.5)
 
 LIDAR_FOV = wp.constant(wp.radians(270.0))
 LIDAR_N = wp.constant(1081)
@@ -77,7 +74,7 @@ def search_k(
         gx = (x + v * ca - OX) * INV_RES
         gy = (y + v * sa - OY) * INV_RES
         total += wp.max(_bilin(like, gx, gy), 0.0)
-    sc[i * nx * nt + j * nt + k] = total
+    sc[(i * nx + j) * nt + k] = total
 
 
 @wp.kernel
@@ -93,6 +90,10 @@ def gn_k(
     vld: wp.array[int],
 ):
     i = wp.tid()
+    res[i] = 0.0
+    jac[i * 3 + 0] = 0.0
+    jac[i * 3 + 1] = 0.0
+    jac[i * 3 + 2] = 0.0
     v = r[i]
     if not (RMIN <= v < RMAX):
         vld[i] = 0
@@ -123,17 +124,12 @@ def gn_k(
 
     cost = 1.0 - l0 / float(L_MAX)
     rw = wp.sqrt(wp.max(w, EPS))
-    resid = rw * cost
-    res[i] = resid
+    res[i] = rw * cost
 
     s = -rw / float(L_MAX) * float(INV_RES)
-    drdx = s * ddu
-    drdy = s * ddv
-    drdt = s * (ddu * (-v * sa) + ddv * (v * ca))
-
-    jac[i * 3] = drdx
-    jac[i * 3 + 1] = drdy
-    jac[i * 3 + 2] = drdt
+    jac[i * 3] = s * ddu
+    jac[i * 3 + 1] = s * ddv
+    jac[i * 3 + 2] = s * (ddu * (-v * sa) + ddv * (v * ca))
 
 
 @wp.kernel
@@ -169,18 +165,22 @@ def add_k(
             wp.atomic_add(g, iy, ix, L_FREE)
         gx += ux
         gy += uy
-    ix = int(x1)
-    iy = int(y1)
-    if 0 <= ix < GRID_W and 0 <= iy < GRID_H:
-        wp.atomic_add(g, iy, ix, L_OCC - L_FREE)
-        wp.atomic_add(g, iy - 1, ix - 1, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy - 1, ix, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy - 1, ix + 1, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy, ix - 1, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy, ix + 1, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy + 1, ix - 1, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy + 1, ix, (L_OCC - L_FREE) * 0.5)
-        wp.atomic_add(g, iy + 1, ix + 1, (L_OCC - L_FREE) * 0.5)
+    hx = int(x1)
+    hy = int(y1)
+    d = L_OCC - L_FREE
+    sp = d * L_SPLAT
+    for dyk in range(-1, 2):
+        for dxk in range(-1, 2):
+            nxk = hx + dxk
+            nyk = hy + dyk
+            if 0 <= nxk < GRID_W and 0 <= nyk < GRID_H:
+                wp.atomic_add(g, nyk, nxk, d if (dxk == 0 and dyk == 0) else sp)
+
+
+@wp.kernel
+def clamp_k(g: wp.array2d[float]):
+    i, j = wp.tid()
+    g[i, j] = wp.clamp(g[i, j], L_MIN, L_MAX)
 
 
 class Bridge:
@@ -210,12 +210,21 @@ class Bridge:
         self._st = wp.array(np.sin(a))
         self.logodds = wp.zeros((int(GRID_H), int(GRID_W)))
         self._r = wp.zeros(n)
-        self._buf = np.empty(n, dtype=np.float32)
 
         hx, htd, sx, std = self._coarse
-        nx = 2 * int(hx / sx) + 1
-        nt = 2 * int(np.radians(htd) / np.radians(std)) + 1
-        self._sc = wp.zeros(nx * nx * nt, dtype=float)
+        self._nx = 2 * int(hx / sx) + 1
+        self._nt = 2 * int(np.radians(htd) / np.radians(std)) + 1
+        self._sx = sx
+        self._st_step = float(np.radians(std))
+        self._sc = wp.zeros(self._nx * self._nx * self._nt, dtype=float)
+
+        ox = (np.arange(self._nx) - (self._nx - 1) * 0.5) * self._sx
+        ot = (np.arange(self._nt) - (self._nt - 1) * 0.5) * self._st_step
+        gx, gy, gt = np.meshgrid(ox, ox, ot, indexing="ij")
+        self._coarse_ot = ot.astype(np.float32)
+        self._coarse_pen = np.exp(
+            -(gx**2 + gy**2) * self._cs_wt**2 - gt**2 * self._cs_wr**2
+        ).astype(np.float32)
 
         self._gn_res = wp.zeros(n)
         self._gn_jac = wp.zeros(n * 3)
@@ -227,8 +236,8 @@ class Bridge:
         self.last_score = 0.0
 
     def step(self, rn, odom):
-        self._buf[:] = rn
-        self._r.assign(self._buf)
+        rn = np.ascontiguousarray(rn, dtype=np.float32)
+        self._r.assign(rn)
         if self._first:
             return self._init(odom)
         seed = self.pose + odom.astype(np.float32)
@@ -280,43 +289,37 @@ class Bridge:
         return self.pose
 
     def _match(self, seed):
-        p = seed.astype(np.float32)
-        hx, htd, sx, std = self._coarse
-        ht = np.radians(htd)
-        st = np.radians(std)
-        nx = 2 * int(hx / sx) + 1
-        nt = 2 * int(ht / st) + 1
+        p = seed.astype(np.float32).copy()
+        nx, nt = self._nx, self._nt
         wp.launch(
             search_k,
             dim=(nx, nx, nt),
             inputs=[
                 self._r,
-                self._st,
                 self._ct,
+                self._st,
                 self.logodds,
                 p[0],
                 p[1],
                 p[2],
-                sx,
-                st,
+                self._sx,
+                self._st_step,
                 nx,
                 nt,
                 self._sc,
             ],
         )
         sc = self._sc.numpy()[: nx * nx * nt].reshape(nx, nx, nt)
-        ox = (np.arange(nx) - (nx - 1) * 0.5) * sx
-        oy = (np.arange(nx) - (nx - 1) * 0.5) * sx
-        ot = (np.arange(nt) - (nt - 1) * 0.5) * st
-        OX, OY, OT = np.meshgrid(ox, oy, ot, indexing="ij")
-        penalty = np.exp(-(OX**2 + OY**2) * self._cs_wt**2 - OT**2 * self._cs_wr**2)
-        best = np.unravel_index(int(np.argmax(sc * penalty)), sc.shape)
-        p[2] = seed[2] + ot[best[2]]
+        weighted = sc * self._coarse_pen
+        best = np.unravel_index(int(np.argmax(weighted)), sc.shape)
+        p[2] = seed[2] + float(self._coarse_ot[best[2]])
+        self.last_score = float(weighted[best])
 
+        n_lidar = int(LIDAR_N)
         for _ in range(self._gn_iters):
             wp.launch(
                 gn_k,
-                dim=int(LIDAR_N),
+                dim=n_lidar,
                 inputs=[
                     self._r,
                     self.logodds,
@@ -334,7 +337,7 @@ class Bridge:
             if nv < 3:
                 break
             r = self._gn_res.numpy()[v]
-            J = self._gn_jac.numpy().reshape(int(LIDAR_N), 3)[v]
+            J = self._gn_jac.numpy().reshape(n_lidar, 3)[v]
 
             sn = np.sqrt(nv)
             r /= sn
@@ -363,8 +366,6 @@ class Bridge:
             p[2] += delta[2]
             if dn < 1e-4 and da < 1e-4:
                 break
-
-        self.last_score = float(sc.ravel().max())
         return p
 
     def _integrate(self):
@@ -379,4 +380,5 @@ class Bridge:
                 self.logodds,
             ],
         )
+        wp.launch(clamp_k, dim=(int(GRID_H), int(GRID_W)), inputs=[self.logodds])
         self._kf = self.pose.copy()
