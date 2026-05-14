@@ -1,4 +1,5 @@
 import numpy as np
+
 import warp as wp
 
 GRID_W = wp.constant(2048)
@@ -50,9 +51,13 @@ def search_k(
     ct: wp.array[float],
     st: wp.array[float],
     like: wp.array2d[float],
-    sx: float, sy: float, stheta: float,
-    ss: float, ts: float,
-    nx: int, nt: int,
+    sx: float,
+    sy: float,
+    stheta: float,
+    ss: float,
+    ts: float,
+    nx: int,
+    nt: int,
     sc: wp.array[float],
 ):
     i, j, k = wp.tid()
@@ -79,7 +84,9 @@ def search_k(
 def gn_k(
     r: wp.array[float],
     like: wp.array2d[float],
-    x: float, y: float, theta: float,
+    x: float,
+    y: float,
+    theta: float,
     w: float,
     res: wp.array[float],
     jac: wp.array[float],
@@ -132,7 +139,9 @@ def gn_k(
 @wp.kernel
 def add_k(
     r: wp.array[float],
-    px: float, py: float, pt: float,
+    px: float,
+    py: float,
+    pt: float,
     g: wp.array2d[float],
 ):
     i = wp.tid()
@@ -223,7 +232,9 @@ class Bridge:
         if self._first:
             return self._init(odom)
         seed = self.pose + odom.astype(np.float32)
-        moved = np.linalg.norm(odom[:2]) > self._min_move or abs(odom[2]) > np.radians(0.5)
+        moved = np.linalg.norm(odom[:2]) > self._min_move or abs(odom[2]) > np.radians(
+            0.5
+        )
         hit = np.any((rn >= float(RMIN)) & (rn < float(RMAX)))
         if not hit:
             self.pose = seed
@@ -232,7 +243,7 @@ class Bridge:
         else:
             self.pose = self._match(seed)
         d = self.pose - self._kf
-        if d[0]*d[0] + d[1]*d[1] > self._kf_d2 or abs(d[2]) > self._kf_dt:
+        if d[0] * d[0] + d[1] * d[1] > self._kf_d2 or abs(d[2]) > self._kf_dt:
             self._integrate()
         return self.pose
 
@@ -275,11 +286,25 @@ class Bridge:
         st = np.radians(std)
         nx = 2 * int(hx / sx) + 1
         nt = 2 * int(ht / st) + 1
-        wp.launch(search_k, dim=(nx, nx, nt), inputs=[
-            self._r, self._st, self._ct, self.logodds,
-            p[0], p[1], p[2], sx, st, nx, nt, self._sc,
-        ])
-        sc = self._sc.numpy()[:nx * nx * nt].reshape(nx, nx, nt)
+        wp.launch(
+            search_k,
+            dim=(nx, nx, nt),
+            inputs=[
+                self._r,
+                self._st,
+                self._ct,
+                self.logodds,
+                p[0],
+                p[1],
+                p[2],
+                sx,
+                st,
+                nx,
+                nt,
+                self._sc,
+            ],
+        )
+        sc = self._sc.numpy()[: nx * nx * nt].reshape(nx, nx, nt)
         ox = (np.arange(nx) - (nx - 1) * 0.5) * sx
         oy = (np.arange(nx) - (nx - 1) * 0.5) * sx
         ot = (np.arange(nt) - (nt - 1) * 0.5) * st
@@ -289,10 +314,21 @@ class Bridge:
         p[2] = seed[2] + ot[best[2]]
 
         for _ in range(self._gn_iters):
-            wp.launch(gn_k, dim=int(LIDAR_N), inputs=[
-                self._r, self.logodds, p[0], p[1], p[2],
-                self._w_occ, self._gn_res, self._gn_jac, self._gn_vld,
-            ])
+            wp.launch(
+                gn_k,
+                dim=int(LIDAR_N),
+                inputs=[
+                    self._r,
+                    self.logodds,
+                    p[0],
+                    p[1],
+                    p[2],
+                    self._w_occ,
+                    self._gn_res,
+                    self._gn_jac,
+                    self._gn_vld,
+                ],
+            )
             v = self._gn_vld.numpy().astype(bool)
             nv = v.sum()
             if nv < 3:
@@ -306,11 +342,13 @@ class Bridge:
 
             dt = (p[2] - seed[2] + np.pi) % (2.0 * np.pi) - np.pi
             JtJ = J.T @ J + np.diag([self._w_trans, self._w_trans, self._w_rot])
-            Jtr = J.T @ r + np.array([
-                self._w_trans * (p[0] - seed[0]),
-                self._w_trans * (p[1] - seed[1]),
-                self._w_rot * dt,
-            ])
+            Jtr = J.T @ r + np.array(
+                [
+                    self._w_trans * (p[0] - seed[0]),
+                    self._w_trans * (p[1] - seed[1]),
+                    self._w_rot * dt,
+                ]
+            )
             try:
                 delta = np.linalg.solve(JtJ, -Jtr)
             except np.linalg.LinAlgError:
@@ -330,7 +368,15 @@ class Bridge:
         return p
 
     def _integrate(self):
-        wp.launch(add_k, dim=int(LIDAR_N), inputs=[
-            self._r, self.pose[0], self.pose[1], self.pose[2], self.logodds,
-        ])
+        wp.launch(
+            add_k,
+            dim=int(LIDAR_N),
+            inputs=[
+                self._r,
+                self.pose[0],
+                self.pose[1],
+                self.pose[2],
+                self.logodds,
+            ],
+        )
         self._kf = self.pose.copy()
