@@ -181,11 +181,10 @@ class Bridge:
             has_cuda = wp.get_cuda_device_count() > 0
         except Exception:
             has_cuda = False
-        forced = (config or {}).get("device", None)
-        self.device = forced if forced else ("cuda" if has_cuda else "cpu")
+        opts = dict(config or {})
+        self.device = opts.get("device") or ("cuda" if has_cuda else "cpu")
         wp.set_device(self.device)
 
-        opts = dict(config or {})
         self._coarse = opts.get("coarse", (0.30, 15.0, 0.05, 1.0))
         self._cs_wt = opts.get("cs_wt", 2.0)
         self._cs_wr = opts.get("cs_wr", 2.0)
@@ -206,7 +205,6 @@ class Bridge:
         self._sx = sx
         self._st_step = float(np.radians(std))
         self._sc = wp.zeros(self._nx * self._nx * self._nt, dtype=float)
-
         ox = (np.arange(self._nx) - (self._nx - 1) * 0.5) * self._sx
         ot = (np.arange(self._nt) - (self._nt - 1) * 0.5) * self._st_step
         gx, gy, gt = np.meshgrid(ox, ox, ot, indexing="ij")
@@ -219,16 +217,11 @@ class Bridge:
         self._a_min = 0.0
         self._a_inc = 0.0
         self._nm = 0
-        self._ct = None
-        self._st = None
-        self._r = None
-        self._gn_res = None
-        self._gn_jac = None
-        self._gn_vld = None
+        self._ct = self._st = self._r = None
+        self._gn_res = self._gn_jac = self._gn_vld = None
         self.pose = np.zeros(3, dtype=np.float32)
         self._kf = np.zeros(3, dtype=np.float32)
         self._first = True
-        self.last_score = 0.0
 
     def configure(self, n_beams, angle_min, angle_increment):
         n_beams = int(n_beams)
@@ -256,58 +249,23 @@ class Bridge:
         return True
 
     def step(self, rn, odom):
-        if self._n == 0:
-            raise RuntimeError("configure() must be called before step()")
         rn = np.ascontiguousarray(rn, dtype=np.float32)
-        if rn.shape[0] != self._n:
-            raise ValueError(f"scan len {rn.shape[0]} != configured {self._n}")
         self._r.assign(rn)
         if self._first:
-            return self._init(odom)
+            self.pose = odom.astype(np.float32)
+            self._kf = self.pose.copy()
+            self._first = False
+            self._integrate()
+            return self.pose
         seed = self.pose + odom.astype(np.float32)
         moved = np.linalg.norm(odom[:2]) > self._min_move or abs(odom[2]) > np.radians(
             0.5
         )
         hit = np.any((rn >= float(RMIN)) & (rn < float(RMAX)))
-        if not hit or not moved:
-            self.pose = seed
-        else:
-            self.pose = self._match(seed)
+        self.pose = seed if (not hit or not moved) else self._match(seed)
         d = self.pose - self._kf
         if d[0] * d[0] + d[1] * d[1] > self._kf_d2 or abs(d[2]) > self._kf_dt:
             self._integrate()
-        return self.pose
-
-    def as_occupancy(self):
-        lo = self.logodds.numpy()
-        out = np.full(lo.shape, -1, dtype=np.int8)
-        known = np.abs(lo) > 0.1
-        p = 1.0 / (1.0 + np.exp(-np.clip(lo[known], -10.0, 10.0)))
-        out[known] = np.clip((p * 100).astype(np.int8), 0, 100)
-        return out
-
-    def save_map(self, path):
-        np.savez_compressed(path, logodds=self.logodds.numpy(), pose=self.pose)
-
-    def load_map(self, path):
-        d = np.load(path)
-        self.logodds.assign(d["logodds"])
-        self.pose = d["pose"]
-        self._kf = self.pose.copy()
-        self._first = False
-
-    def reset(self):
-        self.logodds.zero_()
-        self.pose.fill(0)
-        self._kf.fill(0)
-        self._first = True
-        self.last_score = 0.0
-
-    def _init(self, odom):
-        self.pose = odom.astype(np.float32)
-        self._kf = self.pose.copy()
-        self._first = False
-        self._integrate()
         return self.pose
 
     def _match(self, seed):
@@ -333,10 +291,8 @@ class Bridge:
             ],
         )
         sc = self._sc.numpy()[: nx * nx * nt].reshape(nx, nx, nt)
-        weighted = sc * self._coarse_pen
-        best = np.unravel_index(int(np.argmax(weighted)), sc.shape)
+        best = np.unravel_index(int(np.argmax(sc * self._coarse_pen)), sc.shape)
         p[2] = seed[2] + float(self._coarse_ot[best[2]])
-        self.last_score = float(weighted[best])
         n = self._n
         for _ in range(self._gn_iters):
             wp.launch(
