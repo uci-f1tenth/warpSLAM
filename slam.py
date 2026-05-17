@@ -8,21 +8,14 @@ RES = wp.constant(0.05)
 INV_RES = wp.constant(20.0)
 OX = wp.constant(-51.2)
 OY = wp.constant(-51.2)
-
 L_OCC = wp.constant(0.85)
 L_FREE = wp.constant(-0.4)
 L_MIN = wp.constant(-5.0)
 L_MAX = wp.constant(5.0)
 L_SPLAT = wp.constant(0.5)
-
-LIDAR_FOV = wp.constant(wp.radians(270.0))
-LIDAR_N = wp.constant(1081)
-RMIN = wp.constant(0.1)
-RMAX = wp.constant(40.0)
+RMIN = wp.constant(0.05)
+RMAX = wp.constant(30.0)
 STRIDE = wp.constant(8)
-N_MATCH = wp.constant(LIDAR_N // STRIDE)
-A_MIN = wp.constant(-LIDAR_FOV * 0.5)
-A_INC = wp.constant(LIDAR_FOV / LIDAR_N)
 EPS = wp.constant(1e-8)
 
 
@@ -55,6 +48,7 @@ def search_k(
     ts: float,
     nx: int,
     nt: int,
+    nm: int,
     sc: wp.array[float],
 ):
     i, j, k = wp.tid()
@@ -65,7 +59,7 @@ def search_k(
     c = wp.cos(t)
     s = wp.sin(t)
     total = float(0.0)
-    for b in range(N_MATCH):
+    for b in range(nm):
         v = r[b * STRIDE]
         if not (RMIN <= v < RMAX):
             continue
@@ -81,6 +75,8 @@ def search_k(
 def gn_k(
     r: wp.array[float],
     like: wp.array2d[float],
+    a_min: float,
+    a_inc: float,
     x: float,
     y: float,
     theta: float,
@@ -99,33 +95,26 @@ def gn_k(
         vld[i] = 0
         return
     vld[i] = 1
-
-    a = A_MIN + A_INC * float(i) + theta
+    a = a_min + a_inc * float(i) + theta
     ca = wp.cos(a)
     sa = wp.sin(a)
-
     gx = (x + v * ca - OX) * INV_RES
     gy = (y + v * sa - OY) * INV_RES
-
     ix = int(wp.floor(gx))
     iy = int(wp.floor(gy))
     tx = gx - float(ix)
     ty = gy - float(iy)
-
     v00 = _get(like, ix, iy)
     v10 = _get(like, ix + 1, iy)
     v01 = _get(like, ix, iy + 1)
     v11 = _get(like, ix + 1, iy + 1)
-
     l = wp.lerp(wp.lerp(v00, v10, tx), wp.lerp(v01, v11, tx), ty)
     l0 = wp.max(l, 0.0)
     ddu = wp.lerp(v10 - v00, v11 - v01, ty)
     ddv = wp.lerp(v01 - v00, v11 - v10, tx)
-
     cost = 1.0 - l0 / float(L_MAX)
     rw = wp.sqrt(wp.max(w, EPS))
     res[i] = rw * cost
-
     s = -rw / float(L_MAX) * float(INV_RES)
     jac[i * 3] = s * ddu
     jac[i * 3 + 1] = s * ddv
@@ -135,6 +124,8 @@ def gn_k(
 @wp.kernel
 def add_k(
     r: wp.array[float],
+    a_min: float,
+    a_inc: float,
     px: float,
     py: float,
     pt: float,
@@ -144,7 +135,7 @@ def add_k(
     v = r[i]
     if not (RMIN <= v < RMAX):
         return
-    a = A_MIN + A_INC * float(i) + pt
+    a = a_min + a_inc * float(i) + pt
     ca = wp.cos(a)
     sa = wp.sin(a)
     x0 = (px - OX) * INV_RES
@@ -186,6 +177,14 @@ def clamp_k(g: wp.array2d[float]):
 class Bridge:
     def __init__(self, config=None):
         wp.init()
+        try:
+            has_cuda = wp.get_cuda_device_count() > 0
+        except Exception:
+            has_cuda = False
+        forced = (config or {}).get("device", None)
+        self.device = forced if forced else ("cuda" if has_cuda else "cpu")
+        wp.set_device(self.device)
+
         opts = dict(config or {})
         self._coarse = opts.get("coarse", (0.30, 15.0, 0.05, 1.0))
         self._cs_wt = opts.get("cs_wt", 2.0)
@@ -200,17 +199,7 @@ class Bridge:
         self._kf_dt = np.radians(opts.get("kf_angle", 10.0))
         self._min_move = opts.get("min_move", 0.02)
 
-        n = int(LIDAR_N)
-        stride = opts.get("beam_stride", 8)
-        nm = n // stride
-        fov = float(LIDAR_FOV)
-        step = fov / n
-        a = -fov * 0.5 + step * stride * np.arange(nm, dtype=np.float32)
-        self._ct = wp.array(np.cos(a))
-        self._st = wp.array(np.sin(a))
         self.logodds = wp.zeros((int(GRID_H), int(GRID_W)))
-        self._r = wp.zeros(n)
-
         hx, htd, sx, std = self._coarse
         self._nx = 2 * int(hx / sx) + 1
         self._nt = 2 * int(np.radians(htd) / np.radians(std)) + 1
@@ -226,17 +215,52 @@ class Bridge:
             -(gx**2 + gy**2) * self._cs_wt**2 - gt**2 * self._cs_wr**2
         ).astype(np.float32)
 
-        self._gn_res = wp.zeros(n)
-        self._gn_jac = wp.zeros(n * 3)
-        self._gn_vld = wp.zeros(n, dtype=int)
-
+        self._n = 0
+        self._a_min = 0.0
+        self._a_inc = 0.0
+        self._nm = 0
+        self._ct = None
+        self._st = None
+        self._r = None
+        self._gn_res = None
+        self._gn_jac = None
+        self._gn_vld = None
         self.pose = np.zeros(3, dtype=np.float32)
         self._kf = np.zeros(3, dtype=np.float32)
         self._first = True
         self.last_score = 0.0
 
+    def configure(self, n_beams, angle_min, angle_increment):
+        n_beams = int(n_beams)
+        if (
+            n_beams == self._n
+            and abs(angle_min - self._a_min) < 1e-9
+            and abs(angle_increment - self._a_inc) < 1e-12
+        ):
+            return False
+        if n_beams < STRIDE * 4:
+            raise ValueError(f"scan too small: {n_beams} beams")
+        self._n = n_beams
+        self._a_min = float(angle_min)
+        self._a_inc = float(angle_increment)
+        self._nm = n_beams // int(STRIDE)
+        ang = self._a_min + self._a_inc * int(STRIDE) * np.arange(
+            self._nm, dtype=np.float32
+        )
+        self._ct = wp.array(np.cos(ang).astype(np.float32))
+        self._st = wp.array(np.sin(ang).astype(np.float32))
+        self._r = wp.zeros(self._n)
+        self._gn_res = wp.zeros(self._n)
+        self._gn_jac = wp.zeros(self._n * 3)
+        self._gn_vld = wp.zeros(self._n, dtype=int)
+        return True
+
     def step(self, rn, odom):
+        if self._n == 0:
+            raise RuntimeError("configure() must be called before step()")
         rn = np.ascontiguousarray(rn, dtype=np.float32)
+        if rn.shape[0] != self._n:
+            raise ValueError(f"scan len {rn.shape[0]} != configured {self._n}")
         self._r.assign(rn)
         if self._first:
             return self._init(odom)
@@ -245,9 +269,7 @@ class Bridge:
             0.5
         )
         hit = np.any((rn >= float(RMIN)) & (rn < float(RMAX)))
-        if not hit:
-            self.pose = seed
-        elif not moved:
+        if not hit or not moved:
             self.pose = seed
         else:
             self.pose = self._match(seed)
@@ -306,6 +328,7 @@ class Bridge:
                 self._st_step,
                 nx,
                 nt,
+                self._nm,
                 self._sc,
             ],
         )
@@ -314,15 +337,16 @@ class Bridge:
         best = np.unravel_index(int(np.argmax(weighted)), sc.shape)
         p[2] = seed[2] + float(self._coarse_ot[best[2]])
         self.last_score = float(weighted[best])
-
-        n_lidar = int(LIDAR_N)
+        n = self._n
         for _ in range(self._gn_iters):
             wp.launch(
                 gn_k,
-                dim=n_lidar,
+                dim=n,
                 inputs=[
                     self._r,
                     self.logodds,
+                    self._a_min,
+                    self._a_inc,
                     p[0],
                     p[1],
                     p[2],
@@ -337,12 +361,10 @@ class Bridge:
             if nv < 3:
                 break
             r = self._gn_res.numpy()[v]
-            J = self._gn_jac.numpy().reshape(n_lidar, 3)[v]
-
+            J = self._gn_jac.numpy().reshape(n, 3)[v]
             sn = np.sqrt(nv)
             r /= sn
             J /= sn
-
             dt = (p[2] - seed[2] + np.pi) % (2.0 * np.pi) - np.pi
             JtJ = J.T @ J + np.diag([self._w_trans, self._w_trans, self._w_rot])
             Jtr = J.T @ r + np.array(
@@ -371,9 +393,11 @@ class Bridge:
     def _integrate(self):
         wp.launch(
             add_k,
-            dim=int(LIDAR_N),
+            dim=self._n,
             inputs=[
                 self._r,
+                self._a_min,
+                self._a_inc,
                 self.pose[0],
                 self.pose[1],
                 self.pose[2],
