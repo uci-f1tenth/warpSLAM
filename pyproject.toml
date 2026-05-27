@@ -10,6 +10,12 @@ dependencies = [
     "warp-lang>=1.13.0",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.basedpyright]
 typeCheckingMode = "basic"
 reportAssignmentType = "none"
