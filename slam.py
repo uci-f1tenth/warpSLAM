@@ -1,5 +1,4 @@
 import numpy as np
-
 import warp as wp
 
 GRID_W = wp.constant(2048)
@@ -72,7 +71,7 @@ def search_k(
 
 
 @wp.kernel
-def gn_k(
+def gn_reduce_k(
     r: wp.array[float],
     like: wp.array2d[float],
     a_min: float,
@@ -81,20 +80,12 @@ def gn_k(
     y: float,
     theta: float,
     w: float,
-    res: wp.array[float],
-    jac: wp.array[float],
-    vld: wp.array[int],
+    acc: wp.array[float],
 ):
     i = wp.tid()
-    res[i] = 0.0
-    jac[i * 3 + 0] = 0.0
-    jac[i * 3 + 1] = 0.0
-    jac[i * 3 + 2] = 0.0
     v = r[i]
     if not (RMIN <= v < RMAX):
-        vld[i] = 0
         return
-    vld[i] = 1
     a = a_min + a_inc * float(i) + theta
     ca = wp.cos(a)
     sa = wp.sin(a)
@@ -114,11 +105,21 @@ def gn_k(
     ddv = wp.lerp(v01 - v00, v11 - v10, tx)
     cost = 1.0 - l0 / float(L_MAX)
     rw = wp.sqrt(wp.max(w, EPS))
-    res[i] = rw * cost
+    res = rw * cost
     s = -rw / float(L_MAX) * float(INV_RES)
-    jac[i * 3] = s * ddu
-    jac[i * 3 + 1] = s * ddv
-    jac[i * 3 + 2] = s * (ddu * (-v * sa) + ddv * (v * ca))
+    j0 = s * ddu
+    j1 = s * ddv
+    j2 = s * (ddu * (-v * sa) + ddv * (v * ca))
+    wp.atomic_add(acc, 0, j0 * j0)
+    wp.atomic_add(acc, 1, j0 * j1)
+    wp.atomic_add(acc, 2, j0 * j2)
+    wp.atomic_add(acc, 3, j1 * j1)
+    wp.atomic_add(acc, 4, j1 * j2)
+    wp.atomic_add(acc, 5, j2 * j2)
+    wp.atomic_add(acc, 6, j0 * res)
+    wp.atomic_add(acc, 7, j1 * res)
+    wp.atomic_add(acc, 8, j2 * res)
+    wp.atomic_add(acc, 9, 1.0)
 
 
 @wp.kernel
@@ -149,15 +150,16 @@ def add_k(
     uy = dy / float(n)
     gx = x0
     gy = y0
-    for _ in range(n):
-        ix = int(gx)
-        iy = int(gy)
+    for _ in range(n + 1):
+        ix = int(wp.floor(gx))
+        iy = int(wp.floor(gy))
         if 0 <= ix < GRID_W and 0 <= iy < GRID_H:
             wp.atomic_add(g, iy, ix, L_FREE)
+            wp.atomic_max(g, iy, ix, L_MIN)
         gx += ux
         gy += uy
-    hx = int(x1)
-    hy = int(y1)
+    hx = int(wp.floor(x1))
+    hy = int(wp.floor(y1))
     d = L_OCC - L_FREE
     sp = d * L_SPLAT
     for dyk in range(-1, 2):
@@ -166,12 +168,7 @@ def add_k(
             nyk = hy + dyk
             if 0 <= nxk < GRID_W and 0 <= nyk < GRID_H:
                 wp.atomic_add(g, nyk, nxk, d if (dxk == 0 and dyk == 0) else sp)
-
-
-@wp.kernel
-def clamp_k(g: wp.array2d[float]):
-    i, j = wp.tid()
-    g[i, j] = wp.clamp(g[i, j], L_MIN, L_MAX)
+                wp.atomic_min(g, nyk, nxk, L_MAX)
 
 
 class Bridge:
@@ -208,6 +205,7 @@ class Bridge:
         ox = (np.arange(self._nx) - (self._nx - 1) * 0.5) * self._sx
         ot = (np.arange(self._nt) - (self._nt - 1) * 0.5) * self._st_step
         gx, gy, gt = np.meshgrid(ox, ox, ot, indexing="ij")
+        self._coarse_ox = ox.astype(np.float32)
         self._coarse_ot = ot.astype(np.float32)
         self._coarse_pen = np.exp(
             -(gx**2 + gy**2) * self._cs_wt**2 - gt**2 * self._cs_wr**2
@@ -218,10 +216,18 @@ class Bridge:
         self._a_inc = 0.0
         self._nm = 0
         self._ct = self._st = self._r = None
-        self._gn_res = self._gn_jac = self._gn_vld = None
+        self._gn_acc = wp.zeros(10, dtype=float)
         self.pose = np.zeros(3, dtype=np.float32)
         self._kf = np.zeros(3, dtype=np.float32)
         self._first = True
+
+    @property
+    def n_beams(self):
+        return self._n
+
+    @property
+    def keyframe_pose(self):
+        return self._kf.copy()
 
     def configure(self, n_beams, angle_min, angle_increment):
         n_beams = int(n_beams)
@@ -243,9 +249,6 @@ class Bridge:
         self._ct = wp.array(np.cos(ang).astype(np.float32))
         self._st = wp.array(np.sin(ang).astype(np.float32))
         self._r = wp.zeros(self._n)
-        self._gn_res = wp.zeros(self._n)
-        self._gn_jac = wp.zeros(self._n * 3)
-        self._gn_vld = wp.zeros(self._n, dtype=int)
         return True
 
     def step(self, rn, odom):
@@ -263,7 +266,9 @@ class Bridge:
         )
         hit = np.any((rn >= float(RMIN)) & (rn < float(RMAX)))
         self.pose = seed if (not hit or not moved) else self._match(seed)
+        self.pose[2] = (self.pose[2] + np.pi) % (2.0 * np.pi) - np.pi
         d = self.pose - self._kf
+        d[2] = (d[2] + np.pi) % (2.0 * np.pi) - np.pi
         if d[0] * d[0] + d[1] * d[1] > self._kf_d2 or abs(d[2]) > self._kf_dt:
             self._integrate()
         return self.pose
@@ -292,11 +297,14 @@ class Bridge:
         )
         sc = self._sc.numpy()[: nx * nx * nt].reshape(nx, nx, nt)
         best = np.unravel_index(int(np.argmax(sc * self._coarse_pen)), sc.shape)
+        p[0] = seed[0] + float(self._coarse_ox[best[0]])
+        p[1] = seed[1] + float(self._coarse_ox[best[1]])
         p[2] = seed[2] + float(self._coarse_ot[best[2]])
         n = self._n
         for _ in range(self._gn_iters):
+            self._gn_acc.zero_()
             wp.launch(
-                gn_k,
+                gn_reduce_k,
                 dim=n,
                 inputs=[
                     self._r,
@@ -307,23 +315,23 @@ class Bridge:
                     p[1],
                     p[2],
                     self._w_occ,
-                    self._gn_res,
-                    self._gn_jac,
-                    self._gn_vld,
+                    self._gn_acc,
                 ],
             )
-            v = self._gn_vld.numpy().astype(bool)
-            nv = v.sum()
+            acc = self._gn_acc.numpy()
+            nv = int(acc[9])
             if nv < 3:
                 break
-            r = self._gn_res.numpy()[v]
-            J = self._gn_jac.numpy().reshape(n, 3)[v]
-            sn = np.sqrt(nv)
-            r /= sn
-            J /= sn
+            inv_nv = 1.0 / float(nv)
+            JtJ = np.array(
+                [
+                    [acc[0], acc[1], acc[2]],
+                    [acc[1], acc[3], acc[4]],
+                    [acc[2], acc[4], acc[5]],
+                ]
+            ) * inv_nv + np.diag([self._w_trans, self._w_trans, self._w_rot])
             dt = (p[2] - seed[2] + np.pi) % (2.0 * np.pi) - np.pi
-            JtJ = J.T @ J + np.diag([self._w_trans, self._w_trans, self._w_rot])
-            Jtr = J.T @ r + np.array(
+            Jtr = np.array([acc[6], acc[7], acc[8]]) * inv_nv + np.array(
                 [
                     self._w_trans * (p[0] - seed[0]),
                     self._w_trans * (p[1] - seed[1]),
@@ -360,5 +368,4 @@ class Bridge:
                 self.logodds,
             ],
         )
-        wp.launch(clamp_k, dim=(int(GRID_H), int(GRID_W)), inputs=[self.logodds])
         self._kf = self.pose.copy()

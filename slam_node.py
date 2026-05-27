@@ -133,7 +133,7 @@ class SlamNode(Node):
             a_min, a_inc = -float(msg.angle_min), -float(msg.angle_increment)
         else:
             a_min, a_inc = float(msg.angle_min), float(msg.angle_increment)
-        if not self._cfg or self.bridge._n != n:
+        if not self._cfg or self.bridge.n_beams != n:
             if self.bridge.configure(n, a_min, a_inc):
                 fov = math.degrees(abs(a_inc) * (n - 1))
                 self.get_logger().info(f"scan: {n} beams, FOV={fov:.1f} deg")
@@ -187,7 +187,7 @@ class SlamNode(Node):
         self.tf.sendTransform(t)
 
     def publish_map(self):
-        kf = tuple(self.bridge._kf.tolist())
+        kf = tuple(self.bridge.keyframe_pose.tolist())
         if self._last_kf == kf:
             return
         self._last_kf = kf
