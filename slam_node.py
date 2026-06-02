@@ -35,7 +35,7 @@ PARAMS = dict(
     scan_topic="/scan", odom_topic="/odom",
     map_frame="map", odom_frame="odom",
     invert_scan=False, max_usable_range=10.0,
-    laser_offset_x=0.0, map_publish_period_s=1.0,
+    laser_offset_x=0.0, map_publish_period_s=2.0,
 )
 
 
@@ -163,10 +163,8 @@ class SlamNode(Node):
         m.header.frame_id = self.map_frame
         lo = self.bridge.logodds.numpy().ravel()
         self._md.fill(-1)
-        known = np.abs(lo) > 0.1
-        if known.any():
-            p = 1.0 / (1.0 + np.exp(-np.clip(lo[known], -10.0, 10.0)))
-            self._md[known] = (p * 100.0).astype(np.int8)
+        self._md[lo > 0.5] = 100
+        self._md[lo < -0.5] = 0
         m.data = array.array("b", self._md.tobytes())
         self.map_pub.publish(m)
 

@@ -12,7 +12,7 @@ L_MAX = wp.constant(5.0)
 L_SPLAT = wp.constant(0.5)
 RMIN = wp.constant(0.05)
 RMAX = wp.constant(30.0)
-STRIDE = wp.constant(8)
+STRIDE = wp.constant(16)
 
 
 @wp.func
