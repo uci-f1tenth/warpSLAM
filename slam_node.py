@@ -55,7 +55,7 @@ class SlamNode(Node):
         self.pose = np.zeros(3, dtype=np.float32)
         self.odom = None
         self.prev_odom = None
-        self._last_kf = None
+        self._last_integ = -1
 
         self.create_subscription(LaserScan, g("scan_topic"), self.on_scan, qos_profile_sensor_data)
         self.create_subscription(Odometry, g("odom_topic"), self.on_odom, qos_profile_sensor_data)
@@ -153,10 +153,10 @@ class SlamNode(Node):
         self.tf.sendTransform(t)
 
     def publish_map(self):
-        kf = tuple(self.bridge.keyframe_pose.tolist())
-        if self._last_kf == kf:
+        count = self.bridge.integrations
+        if count == self._last_integ:
             return
-        self._last_kf = kf
+        self._last_integ = count
         now = self.get_clock().now().to_msg()
         m = self._mm
         m.header.stamp = m.info.map_load_time = now

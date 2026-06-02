@@ -205,6 +205,7 @@ class Bridge:
         self.pose = np.zeros(3, dtype=np.float32)
         self._kf = self.pose.copy()
         self._first = True
+        self._integrations = 0
 
     @property
     def n_beams(self):
@@ -213,6 +214,10 @@ class Bridge:
     @property
     def keyframe_pose(self):
         return self._kf.copy()
+
+    @property
+    def integrations(self):
+        return self._integrations
 
     def configure(self, n_beams, angle_min, angle_increment):
         n = int(n_beams)
@@ -347,3 +352,4 @@ class Bridge:
             ],
         )
         self._kf = self.pose.copy()
+        self._integrations += 1
