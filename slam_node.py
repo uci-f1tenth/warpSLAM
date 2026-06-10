@@ -1,171 +1,191 @@
-import array
 import math
+import time
+from array import array
 
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformBroadcaster
 
 import slam
 
 
-def yaw_q(z, w):
-    return math.atan2(2.0 * w * z, 1.0 - 2.0 * z * z)
+def _yaw_from_quat(q):
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    )
 
 
-def wrap(a):
+def _wrap(a):
     return (a + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def compose(a, b):
-    ca, sa = math.cos(a[2]), math.sin(a[2])
-    return (a[0] + ca * b[0] - sa * b[1], a[1] + sa * b[0] + ca * b[1], wrap(a[2] + b[2]))
-
-
-def invert(p):
-    c, s = math.cos(p[2]), math.sin(p[2])
-    return (-(c * p[0] + s * p[1]), s * p[0] - c * p[1], -p[2])
-
-
-PARAMS = dict(
-    scan_topic="/scan", odom_topic="/odom",
-    map_frame="map", odom_frame="odom",
-    invert_scan=False, max_usable_range=10.0,
-    laser_offset_x=0.0, map_publish_period_s=2.0,
-)
 
 
 class SlamNode(Node):
     def __init__(self):
-        super().__init__("slam_node")
-        for k, v in PARAMS.items():
-            self.declare_parameter(k, v)
-        g = lambda k: self.get_parameter(k).value
-        self.map_frame, self.odom_frame = g("map_frame"), g("odom_frame")
-        self._invert = bool(g("invert_scan"))
-        self._max_range = float(g("max_usable_range"))
-        self._loff = float(g("laser_offset_x"))
+        super().__init__("warp_slam")
+        self.declare_parameter("scan_topic", "/scan")
+        self.declare_parameter("odom_topic", "/odom")
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("max_usable_range", 10.0)
+        self.declare_parameter("deskew", True)
+        self.declare_parameter("map_publish_period", 1.0)
+        self.declare_parameter("device", "")
 
-        self.bridge = slam.Bridge()
-        self._cfg = False
-        self.pose = np.zeros(3, dtype=np.float32)
-        self.odom = None
-        self.prev_odom = None
-        self._last_integ = -1
+        self.map_frame = self.get_parameter("map_frame").value
+        self.odom_frame = self.get_parameter("odom_frame").value
+        self.base_frame = self.get_parameter("base_frame").value
+        self.max_range = float(self.get_parameter("max_usable_range").value)
+        self.deskew = bool(self.get_parameter("deskew").value)
+        dev = self.get_parameter("device").value or None
 
-        self.create_subscription(LaserScan, g("scan_topic"), self.on_scan, qos_profile_sensor_data)
-        self.create_subscription(Odometry, g("odom_topic"), self.on_odom, qos_profile_sensor_data)
-        map_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        self.bridge = slam.Bridge(device=dev)
+        self.get_logger().info(f"slam device: {self.bridge.device}")
+
+        self._odom = None
+        self._last_odom = None
+        self._last_stamp = None
+        self._scan_period = 0.025
+        self._published_integrations = -1
+        self._t_acc = 0.0
+        self._t_max = 0.0
+        self._t_n = 0
+
+        sensor_qos = QoSProfile(depth=1)
+        sensor_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
+        self.create_subscription(
+            LaserScan, self.get_parameter("scan_topic").value, self.on_scan, sensor_qos
         )
-        self.map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
+        self.create_subscription(
+            Odometry, self.get_parameter("odom_topic").value, self.on_odom, 20
+        )
+
         self.pose_pub = self.create_publisher(PoseStamped, "/slam_pose", 10)
+        map_qos = QoSProfile(depth=1)
+        self.map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
         self.tf = TransformBroadcaster(self)
-        self.create_timer(float(g("map_publish_period_s")), self.publish_map)
-
-        gw = int(slam.GRID)
-        self._md = np.full(gw * gw, -1, dtype=np.int8)
-        self._mm = OccupancyGrid()
-        self._mm.info.resolution = float(slam.RES)
-        self._mm.info.width = gw
-        self._mm.info.height = gw
-        self._mm.info.origin.position.x = float(slam.ORIGIN)
-        self._mm.info.origin.position.y = float(slam.ORIGIN)
-        self._mm.info.origin.orientation.w = 1.0
-        self._ps = PoseStamped()
-        self._ps.header.frame_id = self.map_frame
-        self._tfm = TransformStamped()
-        self._tfm.header.frame_id = self.map_frame
-        self._tfm.child_frame_id = self.odom_frame
-
-        self.get_logger().info(
-            f"slam_node up | device={self.bridge.device} | "
-            f"scan={g('scan_topic')} odom={g('odom_topic')} | "
-            f"invert_scan={self._invert} | publishes {self.map_frame}->{self.odom_frame} "
-            "(needs vesc_to_odom/publish_tf:=true)"
+        self.create_timer(
+            float(self.get_parameter("map_publish_period").value), self.publish_map
         )
 
     def on_odom(self, msg: Odometry):
         p = msg.pose.pose
-        self.odom = np.array(
-            [p.position.x, p.position.y, yaw_q(p.orientation.z, p.orientation.w)],
-            dtype=np.float32,
-        )
+        self._odom = (p.position.x, p.position.y, _yaw_from_quat(p.orientation))
 
     def on_scan(self, msg: LaserScan):
-        n = len(msg.ranges)
-        if n == 0:
+        if self._odom is None:
+            self.get_logger().warning("no odom yet", throttle_duration_sec=2.0)
             return
-        r = np.asarray(msg.ranges, dtype=np.float32).copy()
-        np.nan_to_num(r, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        hi = min(float(msg.range_max), self._max_range)
-        r[~np.isfinite(r) | (r < float(msg.range_min)) | (r > hi)] = 0.0
 
-        sgn = -1.0 if self._invert else 1.0
-        a_min, a_inc = sgn * float(msg.angle_min), sgn * float(msg.angle_increment)
-        if not self._cfg or self.bridge.n_beams != n:
-            if self.bridge.configure(n, a_min, a_inc):
-                fov = math.degrees(abs(a_inc) * (n - 1))
-                self.get_logger().info(f"scan: {n} beams, FOV={fov:.1f} deg")
-                if not (1000 <= n <= 1200) or abs(fov - 270.0) > 5.0:
-                    self.get_logger().warn("scan unlike UST-10LX; check driver / invert_scan")
-            self._cfg = True
+        n = len(msg.ranges)
+        if self.bridge.configure(n, msg.angle_min, msg.angle_increment):
+            self.get_logger().info(f"configured {n} beams")
 
-        delta = np.zeros(3, dtype=np.float32)
-        if self.odom is not None and self.prev_odom is not None:
-            dx, dy = float(self.odom[0] - self.prev_odom[0]), float(self.odom[1] - self.prev_odom[1])
-            py = float(self.prev_odom[2])
-            cp, sp = math.cos(py), math.sin(py)
-            bx, by = dx * cp + dy * sp, -dx * sp + dy * cp
-            dyaw = wrap(float(self.odom[2]) - py)
-            sy = float(self.pose[2])
-            cs, ss = math.cos(sy), math.sin(sy)
-            delta = np.array([bx * cs - by * ss, bx * ss + by * cs, dyaw], dtype=np.float32)
-        self.prev_odom = None if self.odom is None else self.odom.copy()
+        r = np.nan_to_num(
+            np.asarray(msg.ranges, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        if self.max_range > 0.0:
+            r[r > self.max_range] = 0.0
 
-        self.pose = self.bridge.step(r, delta)
-        self.publish_pose_tf(msg.header.stamp)
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self._last_stamp is not None:
+            dt = stamp - self._last_stamp
+            if 1e-4 < dt < 0.5:
+                self._scan_period = dt
+        self._last_stamp = stamp
 
-    def publish_pose_tf(self, stamp):
-        laser = (float(self.pose[0]), float(self.pose[1]), float(self.pose[2]))
-        mb = compose(laser, (-self._loff, 0.0, 0.0))
-        ps = self._ps
+        odom = self._odom
+        if self._last_odom is None:
+            self._last_odom = odom
+            self.bridge.step(r, np.array(odom, dtype=np.float32))
+            self._publish_pose(msg)
+            return
+
+        lx, ly, lth = self._last_odom
+        dxw, dyw = odom[0] - lx, odom[1] - ly
+        c, s = math.cos(lth), math.sin(lth)
+        bx, by = c * dxw + s * dyw, -s * dxw + c * dyw
+        dth = _wrap(odom[2] - lth)
+        yaw = float(self.bridge.pose[2])
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        delta = np.array([cy * bx - sy * by, sy * bx + cy * by, dth], dtype=np.float32)
+        self._last_odom = odom
+
+        frac = 0.0
+        if self.deskew and msg.time_increment > 0.0:
+            frac = msg.time_increment * (n - 1) / self._scan_period
+            frac = min(max(frac, 0.0), 1.0)
+
+        t0 = time.perf_counter()
+        self.bridge.step(r, delta, deskew_frac=frac)
+        dt = time.perf_counter() - t0
+        self._t_acc += dt
+        self._t_max = max(self._t_max, dt)
+        self._t_n += 1
+        if self._t_n == 400:
+            self.get_logger().info(
+                f"step avg {self._t_acc / self._t_n * 1e3:.2f} ms "
+                f"max {self._t_max * 1e3:.2f} ms"
+            )
+            self._t_acc = self._t_max = 0.0
+            self._t_n = 0
+
+        self._publish_pose(msg)
+
+    def _publish_pose(self, scan_msg):
+        x, y, th = (float(v) for v in self.bridge.pose)
+        stamp = scan_msg.header.stamp
+
+        ps = PoseStamped()
         ps.header.stamp = stamp
-        ps.pose.position.x, ps.pose.position.y = mb[0], mb[1]
-        ps.pose.orientation.z = math.sin(mb[2] * 0.5)
-        ps.pose.orientation.w = math.cos(mb[2] * 0.5)
+        ps.header.frame_id = self.map_frame
+        ps.pose.position.x = x
+        ps.pose.position.y = y
+        ps.pose.orientation.z = math.sin(th * 0.5)
+        ps.pose.orientation.w = math.cos(th * 0.5)
         self.pose_pub.publish(ps)
 
-        if self.odom is None:
-            return
-        mo = compose(mb, invert((float(self.odom[0]), float(self.odom[1]), float(self.odom[2]))))
-        t = self._tfm
+        ox, oy, oth = self._last_odom if self._last_odom else (0.0, 0.0, 0.0)
+        dth = _wrap(th - oth)
+        c, s = math.cos(dth), math.sin(dth)
+        tx = x - (c * ox - s * oy)
+        ty = y - (s * ox + c * oy)
+        t = TransformStamped()
         t.header.stamp = stamp
-        t.transform.translation.x, t.transform.translation.y = mo[0], mo[1]
-        t.transform.rotation.z = math.sin(mo[2] * 0.5)
-        t.transform.rotation.w = math.cos(mo[2] * 0.5)
+        t.header.frame_id = self.map_frame
+        t.child_frame_id = self.odom_frame
+        t.transform.translation.x = tx
+        t.transform.translation.y = ty
+        t.transform.rotation.z = math.sin(dth * 0.5)
+        t.transform.rotation.w = math.cos(dth * 0.5)
         self.tf.sendTransform(t)
 
     def publish_map(self):
-        count = self.bridge.integrations
-        if count == self._last_integ:
+        if self.bridge.integrations == self._published_integrations:
             return
-        self._last_integ = count
-        now = self.get_clock().now().to_msg()
-        m = self._mm
-        m.header.stamp = m.info.map_load_time = now
+        self._published_integrations = self.bridge.integrations
+
+        occ = self.bridge.occupancy()
+        grid = int(slam.GRID)
+        res = float(slam.RES)
+        origin = float(slam.ORIGIN)
+
+        m = OccupancyGrid()
+        m.header.stamp = self.get_clock().now().to_msg()
         m.header.frame_id = self.map_frame
-        lo = self.bridge.logodds.numpy().ravel()
-        self._md.fill(-1)
-        self._md[lo > 0.5] = 100
-        self._md[lo < -0.5] = 0
-        m.data = array.array("b", self._md.tobytes())
+        m.info.map_load_time = m.header.stamp
+        m.info.resolution = res
+        m.info.width = grid
+        m.info.height = grid
+        m.info.origin.position.x = origin - 0.5 * res
+        m.info.origin.position.y = origin - 0.5 * res
+        m.info.origin.orientation.w = 1.0
+        m.data = array("b", occ.tobytes())
         self.map_pub.publish(m)
 
 
