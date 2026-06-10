@@ -15,29 +15,74 @@ L_SPLAT = wp.constant(0.5)
 RMIN = wp.constant(0.05)
 RMAX = wp.constant(30.0)
 STRIDE = wp.constant(8)
-
 LIKE_SIG_INV2 = wp.constant(0.5)
-
 OCC_GATE = wp.constant(0.5)
 FREE_GATE = wp.constant(-0.25)
-
+BACK_DIST = wp.constant(0.30)
 GN_MAX_STEP = wp.constant(0.05)
 GN_MAX_ROT = wp.constant(0.05235988)
 
 
 @wp.func
-def bilin(m: wp.array2d(dtype=float), x: float, y: float):
-    ix = int(wp.floor(x))
-    iy = int(wp.floor(y))
-    tx = x - float(ix)
-    ty = y - float(iy)
-    ix = wp.clamp(ix, 0, GRID - 2)
-    iy = wp.clamp(iy, 0, GRID - 2)
+def beam_local(f: float, mx: float, my: float, mt: float, ex: float, ey: float):
+    a = f * mt
+    return f * mx + ex - a * ey, f * my + a * ex + ey
+
+
+@wp.func
+def to_grid(wx: float, wy: float):
+    return (wx - ORIGIN) * INV_RES, (wy - ORIGIN) * INV_RES
+
+
+@wp.func
+def nearest(gx: float, gy: float):
+    ix = wp.clamp(int(wp.floor(gx + 0.5)), 0, GRID - 1)
+    iy = wp.clamp(int(wp.floor(gy + 0.5)), 0, GRID - 1)
+    return ix, iy
+
+
+@wp.func
+def front_face(occ: wp.array2d(dtype=float), x: float, y: float, ox: float, oy: float):
+    gx, gy = to_grid(x + ox, y + oy)
+    ix, iy = nearest(gx, gy)
+    dist = wp.sqrt(ox * ox + oy * oy)
+    back = 1.0 - wp.min(BACK_DIST, 0.5 * dist) / dist
+    bx, by = to_grid(x + ox * back, y + oy * back)
+    jx, jy = nearest(bx, by)
+    return occ[iy, ix] > OCC_GATE and occ[jy, jx] < FREE_GATE
+
+
+@wp.func
+def sample(m: wp.array2d(dtype=float), x: float, y: float):
+    fx = wp.floor(x)
+    fy = wp.floor(y)
+    tx = x - fx
+    ty = y - fy
+    ix = wp.clamp(int(fx), 0, GRID - 2)
+    iy = wp.clamp(int(fy), 0, GRID - 2)
     v00 = m[iy, ix]
     v10 = m[iy, ix + 1]
     v01 = m[iy + 1, ix]
     v11 = m[iy + 1, ix + 1]
-    return wp.lerp(wp.lerp(v00, v10, tx), wp.lerp(v01, v11, tx), ty), v00, v10, v01, v11
+    return wp.lerp(wp.lerp(v00, v10, tx), wp.lerp(v01, v11, tx), ty)
+
+
+@wp.func
+def sample_grad(m: wp.array2d(dtype=float), x: float, y: float):
+    fx = wp.floor(x)
+    fy = wp.floor(y)
+    tx = x - fx
+    ty = y - fy
+    ix = wp.clamp(int(fx), 0, GRID - 2)
+    iy = wp.clamp(int(fy), 0, GRID - 2)
+    v00 = m[iy, ix]
+    v10 = m[iy, ix + 1]
+    v01 = m[iy + 1, ix]
+    v11 = m[iy + 1, ix + 1]
+    val = wp.lerp(wp.lerp(v00, v10, tx), wp.lerp(v01, v11, tx), ty)
+    du = wp.lerp(v10 - v00, v11 - v01, ty)
+    dv = wp.lerp(v01 - v00, v11 - v10, tx)
+    return val, du, dv
 
 
 @wp.kernel
@@ -46,11 +91,11 @@ def search_k(
     ct: wp.array(dtype=float),
     st: wp.array(dtype=float),
     like: wp.array2d(dtype=float),
-    occg: wp.array2d(dtype=float),
+    occ: wp.array2d(dtype=float),
     ctrl: wp.array(dtype=float),
     pen: wp.array(dtype=float),
-    ss: float,
-    ts: float,
+    step_xy: float,
+    step_th: float,
     nx: int,
     nt: int,
     nm: int,
@@ -59,9 +104,9 @@ def search_k(
 ):
     i, j, k = wp.tid()
     h = float(nx - 1) * 0.5
-    x = ctrl[0] + (float(i) - h) * ss
-    y = ctrl[1] + (float(j) - h) * ss
-    t = ctrl[2] + (float(k) - float(nt - 1) * 0.5) * ts
+    x = ctrl[0] + (float(i) - h) * step_xy
+    y = ctrl[1] + (float(j) - h) * step_xy
+    t = ctrl[2] + (float(k) - float(nt - 1) * 0.5) * step_th
     mx = ctrl[3]
     my = ctrl[4]
     mt = ctrl[5]
@@ -72,34 +117,21 @@ def search_k(
         v = r[b * STRIDE]
         if v >= RMIN and v < RMAX:
             f = float(b * STRIDE) * inv_n - 0.5
-            a = f * mt
-            ex = v * ct[b]
-            ey = v * st[b]
-            lx = f * mx + ex - a * ey
-            ly = f * my + a * ex + ey
-            gx = (x + lx * c - ly * s - ORIGIN) * INV_RES
-            gy = (y + lx * s + ly * c - ORIGIN) * INV_RES
-            ix = wp.clamp(int(wp.floor(gx + 0.5)), 0, GRID - 1)
-            iy = wp.clamp(int(wp.floor(gy + 0.5)), 0, GRID - 1)
-            if occg[iy, ix] > OCC_GATE:
-                rn = wp.sqrt(lx * lx + ly * ly)
-                sc2 = 1.0 - wp.min(0.30, 0.5 * rn) / rn
-                bx = (x + (lx * c - ly * s) * sc2 - ORIGIN) * INV_RES
-                by = (y + (lx * s + ly * c) * sc2 - ORIGIN) * INV_RES
-                ibx = wp.clamp(int(wp.floor(bx + 0.5)), 0, GRID - 1)
-                iby = wp.clamp(int(wp.floor(by + 0.5)), 0, GRID - 1)
-                if occg[iby, ibx] < FREE_GATE:
-                    l, v00, v10, v01, v11 = bilin(like, gx, gy)
-                    total += wp.max(l, 0.0)
+            lx, ly = beam_local(f, mx, my, mt, v * ct[b], v * st[b])
+            ox = lx * c - ly * s
+            oy = lx * s + ly * c
+            if front_face(occ, x, y, ox, oy):
+                gx, gy = to_grid(x + ox, y + oy)
+                total += wp.max(sample(like, gx, gy), 0.0)
     idx = (i * nx + j) * nt + k
     out[idx] = total * pen[idx]
 
 
 @wp.kernel
 def argmax_k(
-    sc: wp.array(dtype=float),
-    ox: wp.array(dtype=float),
-    ot: wp.array(dtype=float),
+    score: wp.array(dtype=float),
+    off_xy: wp.array(dtype=float),
+    off_th: wp.array(dtype=float),
     ctrl: wp.array(dtype=float),
     nx: int,
     nt: int,
@@ -107,25 +139,24 @@ def argmax_k(
 ):
     best = float(-1.0)
     bi = int(0)
-    n = nx * nx * nt
-    for idx in range(n):
-        v = sc[idx]
+    for idx in range(nx * nx * nt):
+        v = score[idx]
         if v > best:
             best = v
             bi = idx
     k = bi % nt
     j = (bi // nt) % nx
     i = bi // (nt * nx)
-    pose[0] = ctrl[0] + ox[i]
-    pose[1] = ctrl[1] + ox[j]
-    pose[2] = ctrl[2] + ot[k]
+    pose[0] = ctrl[0] + off_xy[i]
+    pose[1] = ctrl[1] + off_xy[j]
+    pose[2] = ctrl[2] + off_th[k]
 
 
 @wp.kernel
 def gn_k(
     r: wp.array(dtype=float),
     like: wp.array2d(dtype=float),
-    occg: wp.array2d(dtype=float),
+    occ: wp.array2d(dtype=float),
     a_min: float,
     a_inc: float,
     inv_n: float,
@@ -138,40 +169,21 @@ def gn_k(
     if v < RMIN or v >= RMAX:
         return
     ang = a_min + a_inc * float(i)
-    ex = v * wp.cos(ang)
-    ey = v * wp.sin(ang)
     f = float(i) * inv_n - 0.5
-    a = f * ctrl[5]
-    lx = f * ctrl[3] + ex - a * ey
-    ly = f * ctrl[4] + a * ex + ey
+    lx, ly = beam_local(f, ctrl[3], ctrl[4], ctrl[5], v * wp.cos(ang), v * wp.sin(ang))
     c = wp.cos(pose[2])
     s = wp.sin(pose[2])
     ox = lx * c - ly * s
     oy = lx * s + ly * c
-    gx = (pose[0] + ox - ORIGIN) * INV_RES
-    gy = (pose[1] + oy - ORIGIN) * INV_RES
-    ix = wp.clamp(int(wp.floor(gx + 0.5)), 0, GRID - 1)
-    iy = wp.clamp(int(wp.floor(gy + 0.5)), 0, GRID - 1)
-    if occg[iy, ix] <= OCC_GATE:
+    if not front_face(occ, pose[0], pose[1], ox, oy):
         return
-    rn = wp.sqrt(ox * ox + oy * oy)
-    sc2 = 1.0 - wp.min(0.30, 0.5 * rn) / rn
-    bx = (pose[0] + ox * sc2 - ORIGIN) * INV_RES
-    by = (pose[1] + oy * sc2 - ORIGIN) * INV_RES
-    ibx = wp.clamp(int(wp.floor(bx + 0.5)), 0, GRID - 1)
-    iby = wp.clamp(int(wp.floor(by + 0.5)), 0, GRID - 1)
-    if occg[iby, ibx] >= FREE_GATE:
-        return
-    l, v00, v10, v01, v11 = bilin(like, gx, gy)
-    tx = gx - wp.floor(gx)
-    ty = gy - wp.floor(gy)
-    ddu = wp.lerp(v10 - v00, v11 - v01, ty)
-    ddv = wp.lerp(v01 - v00, v11 - v10, tx)
+    gx, gy = to_grid(pose[0] + ox, pose[1] + oy)
+    l, du, dv = sample_grad(like, gx, gy)
     res = 1.0 - wp.max(l, 0.0)
     sc = -float(INV_RES)
-    j0 = sc * ddu
-    j1 = sc * ddv
-    j2 = sc * (ddu * (-oy) + ddv * ox)
+    j0 = sc * du
+    j1 = sc * dv
+    j2 = sc * (du * (-oy) + dv * ox)
     wp.atomic_add(acc, 0, j0 * j0)
     wp.atomic_add(acc, 1, j0 * j1)
     wp.atomic_add(acc, 2, j0 * j2)
@@ -217,8 +229,8 @@ def solve_k(
     d = -(wp.inverse(A) * b)
     dn = wp.sqrt(d[0] * d[0] + d[1] * d[1])
     if dn > GN_MAX_STEP:
-        sfac = GN_MAX_STEP / dn
-        d = wp.vec3(d[0] * sfac, d[1] * sfac, d[2])
+        k = GN_MAX_STEP / dn
+        d = wp.vec3(d[0] * k, d[1] * k, d[2])
     da = wp.abs(d[2])
     if da > GN_MAX_ROT:
         d = wp.vec3(d[0], d[1], d[2] * GN_MAX_ROT / da)
@@ -235,7 +247,7 @@ def integrate_k(
     inv_n: float,
     ctrl: wp.array(dtype=float),
     pose: wp.array(dtype=float),
-    g: wp.array2d(dtype=float),
+    logodds: wp.array2d(dtype=float),
     like: wp.array2d(dtype=float),
 ):
     i = wp.tid()
@@ -243,20 +255,14 @@ def integrate_k(
     if v < RMIN or v >= RMAX:
         return
     ang = a_min + a_inc * float(i)
-    ex = v * wp.cos(ang)
-    ey = v * wp.sin(ang)
     f = float(i) * inv_n - 0.5
-    a = f * ctrl[5]
     sx = f * ctrl[3]
     sy = f * ctrl[4]
-    lx = sx + ex - a * ey
-    ly = sy + a * ex + ey
+    lx, ly = beam_local(f, ctrl[3], ctrl[4], ctrl[5], v * wp.cos(ang), v * wp.sin(ang))
     c = wp.cos(pose[2])
     s = wp.sin(pose[2])
-    x0 = (pose[0] + sx * c - sy * s - ORIGIN) * INV_RES
-    y0 = (pose[1] + sx * s + sy * c - ORIGIN) * INV_RES
-    x1 = (pose[0] + lx * c - ly * s - ORIGIN) * INV_RES
-    y1 = (pose[1] + lx * s + ly * c - ORIGIN) * INV_RES
+    x0, y0 = to_grid(pose[0] + sx * c - sy * s, pose[1] + sx * s + sy * c)
+    x1, y1 = to_grid(pose[0] + lx * c - ly * s, pose[1] + lx * s + ly * c)
     dx = x1 - x0
     dy = y1 - y0
     n = int(wp.max(wp.abs(dx), wp.abs(dy))) + 1
@@ -268,37 +274,37 @@ def integrate_k(
         ix = int(wp.floor(gx))
         iy = int(wp.floor(gy))
         if 0 <= ix and ix < GRID and 0 <= iy and iy < GRID:
-            wp.atomic_add(g, iy, ix, L_FREE)
-            wp.atomic_max(g, iy, ix, L_MIN)
+            wp.atomic_add(logodds, iy, ix, L_FREE)
+            wp.atomic_max(logodds, iy, ix, L_MIN)
         gx += ux
         gy += uy
     hx = int(wp.floor(x1))
     hy = int(wp.floor(y1))
-    d = L_OCC - L_FREE
-    sp = d * L_SPLAT
-    for dyk in range(-1, 2):
-        for dxk in range(-1, 2):
-            nxk = hx + dxk
-            nyk = hy + dyk
-            if 0 <= nxk and nxk < GRID and 0 <= nyk and nyk < GRID:
-                wp.atomic_add(g, nyk, nxk, d if (dxk == 0 and dyk == 0) else sp)
-                wp.atomic_min(g, nyk, nxk, L_MAX)
-    for dyk in range(-2, 3):
-        for dxk in range(-2, 3):
-            nxk = hx + dxk
-            nyk = hy + dyk
-            if 0 <= nxk and nxk < GRID and 0 <= nyk and nyk < GRID:
-                du = float(nxk) - x1
-                dv = float(nyk) - y1
+    hit = L_OCC - L_FREE
+    splat = hit * L_SPLAT
+    for dj in range(-1, 2):
+        for di in range(-1, 2):
+            ix = hx + di
+            iy = hy + dj
+            if 0 <= ix and ix < GRID and 0 <= iy and iy < GRID:
+                wp.atomic_add(logodds, iy, ix, hit if (di == 0 and dj == 0) else splat)
+                wp.atomic_min(logodds, iy, ix, L_MAX)
+    for dj in range(-2, 3):
+        for di in range(-2, 3):
+            ix = hx + di
+            iy = hy + dj
+            if 0 <= ix and ix < GRID and 0 <= iy and iy < GRID:
+                du = float(ix) - x1
+                dv = float(iy) - y1
                 wp.atomic_max(
-                    like, nyk, nxk, wp.exp(-(du * du + dv * dv) * LIKE_SIG_INV2)
+                    like, iy, ix, wp.exp(-(du * du + dv * dv) * LIKE_SIG_INV2)
                 )
 
 
 @wp.kernel
-def occ_k(g: wp.array2d(dtype=float), out: wp.array2d(dtype=wp.int8)):
+def occ_k(logodds: wp.array2d(dtype=float), out: wp.array2d(dtype=wp.int8)):
     iy, ix = wp.tid()
-    l = g[iy, ix]
+    l = logodds[iy, ix]
     o = int(-1)
     if wp.abs(l) > 0.1:
         p = 1.0 / (1.0 + wp.exp(-wp.clamp(l, -10.0, 10.0)))
@@ -315,12 +321,8 @@ class Bridge:
     W_TRANS, W_ROT = 0.5, 2.0
     KF_D2, KF_DTH = 0.20**2, np.radians(10.0)
     MIN_MOVE_XY, MIN_MOVE_TH = 0.02, np.radians(0.5)
-    COARSE_HX, COARSE_HTH, COARSE_SX, COARSE_STH = (
-        0.30,
-        np.radians(15.0),
-        0.05,
-        np.radians(1.0),
-    )
+    COARSE_HX, COARSE_HTH = 0.30, np.radians(15.0)
+    COARSE_SX, COARSE_STH = 0.05, np.radians(1.0)
     CS_WT, CS_WR = 2.0, 2.0
 
     def __init__(self, device=None):
@@ -336,25 +338,25 @@ class Bridge:
         self.logodds = wp.zeros((int(GRID), int(GRID)))
         self.like = wp.zeros((int(GRID), int(GRID)))
         self._occ = wp.zeros((int(GRID), int(GRID)), dtype=wp.int8)
-        self._nx = 2 * int(self.COARSE_HX / self.COARSE_SX) + 1
-        self._nt = 2 * int(self.COARSE_HTH / self.COARSE_STH) + 1
-        self._sc = wp.zeros(self._nx * self._nx * self._nt, dtype=float)
-        ox = (np.arange(self._nx) - (self._nx - 1) * 0.5) * self.COARSE_SX
-        ot = (np.arange(self._nt) - (self._nt - 1) * 0.5) * self.COARSE_STH
-        gx, gy, gt = np.meshgrid(ox, ox, ot, indexing="ij")
-        pen = np.exp(-(gx**2 + gy**2) * self.CS_WT**2 - gt**2 * self.CS_WR**2)
-        self._oxd = wp.array(ox.astype(np.float32))
-        self._otd = wp.array(ot.astype(np.float32))
-        self._pen = wp.array(pen.ravel().astype(np.float32))
-
-        self._n = 0
-        self._a_min = self._a_inc = 0.0
-        self._inv_n = 0.0
-        self._nm = 0
-        self._ct = self._st = self._r = None
         self._acc = wp.zeros(10, dtype=float)
         self._ctrl = wp.zeros(6, dtype=float)
         self._pose_d = wp.zeros(3, dtype=float)
+
+        self._nx = 2 * int(self.COARSE_HX / self.COARSE_SX) + 1
+        self._nt = 2 * int(self.COARSE_HTH / self.COARSE_STH) + 1
+        self._score = wp.zeros(self._nx * self._nx * self._nt, dtype=float)
+        off_xy = (np.arange(self._nx) - (self._nx - 1) * 0.5) * self.COARSE_SX
+        off_th = (np.arange(self._nt) - (self._nt - 1) * 0.5) * self.COARSE_STH
+        gx, gy, gt = np.meshgrid(off_xy, off_xy, off_th, indexing="ij")
+        pen = np.exp(-(gx**2 + gy**2) * self.CS_WT**2 - gt**2 * self.CS_WR**2)
+        self._off_xy = wp.array(off_xy.astype(np.float32))
+        self._off_th = wp.array(off_th.astype(np.float32))
+        self._pen = wp.array(pen.ravel().astype(np.float32))
+
+        self._n = 0
+        self._nm = 0
+        self._a_min = self._a_inc = self._inv_n = 0.0
+        self._ct = self._st = self._r = None
         self._graph = None
         self._graph_tried = False
         self.pose = np.zeros(3, dtype=np.float32)
@@ -397,6 +399,65 @@ class Bridge:
         self._graph_tried = False
         return True
 
+    def step(self, ranges, odom, deskew_frac=0.0):
+        r = np.ascontiguousarray(ranges, dtype=np.float32)
+        odom = np.asarray(odom, dtype=np.float32)
+        self._r.assign(r)
+
+        if self._first:
+            self._first = False
+            self.pose = odom.copy()
+            self._kf = self.pose.copy()
+            self._ctrl.assign(np.array([*self.pose, 0.0, 0.0, 0.0], dtype=np.float32))
+            self._pose_d.assign(self.pose)
+            self._integrate()
+            return self.pose
+
+        seed = self.pose + odom
+        moved = (
+            np.linalg.norm(odom[:2]) > self.MIN_MOVE_XY
+            or abs(odom[2]) > self.MIN_MOVE_TH
+        )
+        hit = bool(np.any((r >= float(RMIN)) & (r < float(RMAX))))
+
+        fr = float(np.clip(deskew_frac, 0.0, 1.0))
+        c, s = np.cos(self.pose[2]), np.sin(self.pose[2])
+        mx = (odom[0] * c + odom[1] * s) * fr
+        my = (-odom[0] * s + odom[1] * c) * fr
+        self._ctrl.assign(np.array([*seed, mx, my, odom[2] * fr], dtype=np.float32))
+
+        if hit and moved:
+            self._ensure_graph()
+            if self._graph is not None:
+                wp.capture_launch(self._graph)
+            else:
+                self._pipeline()
+            self.pose = self._pose_d.numpy().astype(np.float32).copy()
+        else:
+            self.pose = seed.copy()
+            self._pose_d.assign(self.pose)
+
+        self.pose[2] = _wrap(float(self.pose[2]))
+        d = self.pose - self._kf
+        d[2] = _wrap(float(d[2]))
+        if d[0] * d[0] + d[1] * d[1] > self.KF_D2 or abs(d[2]) > self.KF_DTH:
+            self._integrate()
+        return self.pose
+
+    def occupancy(self):
+        if self._is_cuda:
+            wp.launch(
+                occ_k, dim=(int(GRID), int(GRID)), inputs=[self.logodds, self._occ]
+            )
+            return self._occ.numpy()
+        lo = self.logodds.numpy()
+        out = np.full(lo.shape, -1, dtype=np.int8)
+        known = np.abs(lo) > 0.1
+        if known.any():
+            p = 1.0 / (1.0 + np.exp(-np.clip(lo[known], -10.0, 10.0)))
+            out[known] = (p * 100.0).astype(np.int8)
+        return out
+
     def _pipeline(self):
         wp.launch(
             search_k,
@@ -415,16 +476,16 @@ class Bridge:
                 self._nt,
                 self._nm,
                 self._inv_n,
-                self._sc,
+                self._score,
             ],
         )
         wp.launch(
             argmax_k,
             dim=1,
             inputs=[
-                self._sc,
-                self._oxd,
-                self._otd,
+                self._score,
+                self._off_xy,
+                self._off_th,
                 self._ctrl,
                 self._nx,
                 self._nt,
@@ -473,73 +534,6 @@ class Bridge:
         except Exception as e:
             print(f"graph capture failed: {e}")
             self._graph = None
-
-    def step(self, ranges, odom, deskew_frac=0.0):
-        r = np.ascontiguousarray(ranges, dtype=np.float32)
-        self._r.assign(r)
-        if self._first:
-            self.pose = odom.astype(np.float32).copy()
-            self._kf = self.pose.copy()
-            self._first = False
-            self._ctrl.assign(
-                np.array(
-                    [self.pose[0], self.pose[1], self.pose[2], 0.0, 0.0, 0.0],
-                    dtype=np.float32,
-                )
-            )
-            self._pose_d.assign(self.pose)
-            self._integrate()
-            return self.pose
-
-        seed = (self.pose + odom.astype(np.float32)).astype(np.float32)
-        moved = (
-            np.linalg.norm(odom[:2]) > self.MIN_MOVE_XY
-            or abs(odom[2]) > self.MIN_MOVE_TH
-        )
-        hit = bool(np.any((r >= float(RMIN)) & (r < float(RMAX))))
-
-        fr = float(min(max(deskew_frac, 0.0), 1.0))
-        c, s = float(np.cos(self.pose[2])), float(np.sin(self.pose[2]))
-        bx = (float(odom[0]) * c + float(odom[1]) * s) * fr
-        by = (-float(odom[0]) * s + float(odom[1]) * c) * fr
-        self._ctrl.assign(
-            np.array(
-                [seed[0], seed[1], seed[2], bx, by, float(odom[2]) * fr],
-                dtype=np.float32,
-            )
-        )
-
-        if hit and moved:
-            self._ensure_graph()
-            if self._graph is not None:
-                wp.capture_launch(self._graph)
-            else:
-                self._pipeline()
-            self.pose = self._pose_d.numpy().astype(np.float32).copy()
-        else:
-            self.pose = seed.copy()
-            self._pose_d.assign(self.pose)
-
-        self.pose[2] = _wrap(float(self.pose[2]))
-        d = self.pose - self._kf
-        d[2] = _wrap(float(d[2]))
-        if d[0] * d[0] + d[1] * d[1] > self.KF_D2 or abs(d[2]) > self.KF_DTH:
-            self._integrate()
-        return self.pose
-
-    def occupancy(self):
-        if self._is_cuda:
-            wp.launch(
-                occ_k, dim=(int(GRID), int(GRID)), inputs=[self.logodds, self._occ]
-            )
-            return self._occ.numpy()
-        lo = self.logodds.numpy()
-        out = np.full(lo.shape, -1, dtype=np.int8)
-        known = np.abs(lo) > 0.1
-        if known.any():
-            p = 1.0 / (1.0 + np.exp(-np.clip(lo[known], -10.0, 10.0)))
-            out[known] = (p * 100.0).astype(np.int8)
-        return out
 
     def _integrate(self):
         wp.launch(
