@@ -282,14 +282,19 @@ def test_occupancy(bridge):
     wall = max(at(4.0, 0.5), at(4.0, 0.0), at(0.5, -4.0))
     free = at(-1.0, -1.0)
     unknown = at(30.0, 30.0)
+    crop, x0, y0 = bridge.snapshot()
+    cwall = crop[int(round((0.5 - org) / res)) - y0, int(round((4.0 - org) / res)) - x0]
     check(
         "occupancy_semantics",
         occ.shape == (grid, grid)
         and occ.dtype == np.int8
         and wall > 60
         and 0 <= free < 20
-        and unknown == -1,
-        f"wall {wall}, free {free}, unknown {unknown}",
+        and unknown == -1
+        and max(crop.shape) < 200
+        and cwall == wall,
+        f"wall {wall}, free {free}, unknown {unknown}, "
+        f"crop {crop.shape[1]}x{crop.shape[0]} of {grid}x{grid}",
     )
 
 
@@ -459,7 +464,7 @@ def test_dynamic_obstacle():
     lidar = Lidar()
     room = square_room()
     pose_fn = arc_pose_fn([-1.5, -1.0, 0.3], v=2.0, w=2.0 / 1.6)
-    t = np.arange(120) * lidar.period
+    t = np.arange(200) * lidar.period
 
     def world(tk):
         k = tk / lidar.period
@@ -469,10 +474,21 @@ def test_dynamic_obstacle():
 
     b = slam.Bridge(device="cpu")
     errs, _ = drive(b, lidar, world, pose_fn, t, rng)
+    occ = b.occupancy()
+    res, org = float(slam.RES), float(slam.ORIGIN)
+
+    def cells(wx0, wy0, wx1, wy1):
+        i0, i1 = int((wy0 - org) / res), int((wy1 - org) / res)
+        j0, j1 = int((wx0 - org) / res), int((wx1 - org) / res)
+        return occ[i0:i1, j0:j1]
+
+    ghost = int(cells(0.5, -2.8, 1.1, 1.8).max())
+    speckle = int((cells(-3.4, -3.4, 3.4, 3.4) > 60).sum())
     check(
-        "dynamic_obstacle",
-        errs[:, 0].max() < 0.06 and errs[-1, 0] < 0.04,
-        f"max {errs[:, 0].max() * 100:.1f} cm with crossing obstacle",
+        "dynamic_obstacle_erased",
+        errs[:, 0].max() < 0.06 and errs[-1, 0] < 0.04 and ghost < 50 and speckle <= 2,
+        f"max {errs[:, 0].max() * 100:.1f} cm, ghost max {ghost}, "
+        f"interior speckles {speckle}",
     )
 
 
@@ -480,16 +496,22 @@ def test_spin_in_place():
     rng = np.random.default_rng(5)
     lidar = Lidar()
     room = square_room()
-    pose_fn = arc_pose_fn([0.5, -0.7, 0.0], v=1e-4, w=5.0)
-    t = np.arange(90) * lidar.period
+    settle = 10 * lidar.period
+
+    def pose_fn(tq):
+        tq = np.atleast_1d(np.asarray(tq, dtype=np.float64))
+        th = 5.0 * np.clip(tq - settle, 0.0, None)
+        return np.stack([np.full_like(th, 0.5), np.full_like(th, -0.7), th], axis=1)
+
+    t = np.arange(100) * lidar.period
     b = slam.Bridge(device="cpu")
     errs, _ = drive(b, lidar, lambda _: room, pose_fn, t, rng)
     check(
         "spin_5_rad_s",
-        errs[:, 0].max() < 0.06 and np.degrees(errs[:, 1].max()) < 1.0,
+        errs[:, 0].max() < 0.03 and np.degrees(errs[:, 1].max()) < 0.5,
         f"xy max {errs[:, 0].max() * 100:.1f} cm, heading max "
         f"{np.degrees(errs[:, 1].max()):.2f} deg over "
-        f"{np.degrees(5.0 * t[-1]):.0f} deg of spin",
+        f"{np.degrees(5.0 * (t[-1] - settle)):.0f} deg of spin",
     )
 
 

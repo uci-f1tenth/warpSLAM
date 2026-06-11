@@ -9,9 +9,8 @@ INV_RES = wp.constant(20.0)
 ORIGIN = wp.constant(-51.2)
 L_OCC = wp.constant(0.85)
 L_FREE = wp.constant(-0.4)
-L_MIN = wp.constant(-5.0)
-L_MAX = wp.constant(5.0)
-L_SPLAT = wp.constant(0.5)
+L_MIN = wp.constant(-2.5)
+L_MAX = wp.constant(2.5)
 RMIN = wp.constant(0.05)
 RMAX = wp.constant(30.0)
 STRIDE = wp.constant(8)
@@ -280,15 +279,9 @@ def integrate_k(
         gy += uy
     hx = int(wp.floor(x1))
     hy = int(wp.floor(y1))
-    hit = L_OCC - L_FREE
-    splat = hit * L_SPLAT
-    for dj in range(-1, 2):
-        for di in range(-1, 2):
-            ix = hx + di
-            iy = hy + dj
-            if 0 <= ix and ix < GRID and 0 <= iy and iy < GRID:
-                wp.atomic_add(logodds, iy, ix, hit if (di == 0 and dj == 0) else splat)
-                wp.atomic_min(logodds, iy, ix, L_MAX)
+    if 0 <= hx and hx < GRID and 0 <= hy and hy < GRID:
+        wp.atomic_add(logodds, hy, hx, L_OCC - L_FREE)
+        wp.atomic_min(logodds, hy, hx, L_MAX)
     for dj in range(-2, 3):
         for di in range(-2, 3):
             ix = hx + di
@@ -429,7 +422,12 @@ class Bridge:
         if hit and moved:
             self._ensure_graph()
             if self._graph is not None:
-                wp.capture_launch(self._graph)
+                try:
+                    wp.capture_launch(self._graph)
+                except Exception as e:
+                    print(f"graph replay failed: {e}")
+                    self._graph = None
+                    self._pipeline()
             else:
                 self._pipeline()
             self.pose = self._pose_d.numpy().astype(np.float32).copy()
@@ -443,6 +441,17 @@ class Bridge:
         if d[0] * d[0] + d[1] * d[1] > self.KF_D2 or abs(d[2]) > self.KF_DTH:
             self._integrate()
         return self.pose
+
+    def snapshot(self):
+        occ = self.occupancy()
+        known = occ != -1
+        rows = np.flatnonzero(known.any(axis=1))
+        if rows.size == 0:
+            return None
+        cols = np.flatnonzero(known.any(axis=0))
+        y0, y1 = int(rows[0]), int(rows[-1]) + 1
+        x0, x1 = int(cols[0]), int(cols[-1]) + 1
+        return occ[y0:y1, x0:x1], x0, y0
 
     def occupancy(self):
         if self._is_cuda:

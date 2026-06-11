@@ -5,9 +5,9 @@ from array import array
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformBroadcaster
 
@@ -15,9 +15,8 @@ import slam
 
 
 def _yaw_from_quat(q):
-    return math.atan2(
-        2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    )
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
 def _wrap(a):
@@ -34,7 +33,8 @@ class SlamNode(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("max_usable_range", 10.0)
         self.declare_parameter("deskew", True)
-        self.declare_parameter("map_publish_period", 1.0)
+        self.declare_parameter("map_publish_period", 0.2)
+        self.declare_parameter("path_min_step", 0.10)
         self.declare_parameter("device", "")
 
         self.map_frame = self.get_parameter("map_frame").value
@@ -42,16 +42,22 @@ class SlamNode(Node):
         self.base_frame = self.get_parameter("base_frame").value
         self.max_range = float(self.get_parameter("max_usable_range").value)
         self.deskew = bool(self.get_parameter("deskew").value)
+        self.path_step = float(self.get_parameter("path_min_step").value)
         dev = self.get_parameter("device").value or None
 
         self.bridge = slam.Bridge(device=dev)
         self.get_logger().info(f"slam device: {self.bridge.device}")
+        if not str(self.bridge.device).startswith("cuda"):
+            self.get_logger().warning("no CUDA device, running on CPU")
 
         self._odom = None
         self._last_odom = None
         self._last_stamp = None
+        self._last_body = (0.0, 0.0, 0.0)
         self._scan_period = 0.025
         self._published_integrations = -1
+        self._path = []
+        self._path_published = 0
         self._t_acc = 0.0
         self._t_max = 0.0
         self._t_n = 0
@@ -59,25 +65,34 @@ class SlamNode(Node):
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         self.create_subscription(
-            LaserScan, self.get_parameter("scan_topic").value, self.on_scan, sensor_qos
-        )
+            LaserScan, self.get_parameter("scan_topic").value,
+            self.on_scan, sensor_qos)
         self.create_subscription(
-            Odometry, self.get_parameter("odom_topic").value, self.on_odom, 20
-        )
+            Odometry, self.get_parameter("odom_topic").value,
+            self.on_odom, 20)
 
+        latched = QoSProfile(depth=1)
+        latched.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
         self.pose_pub = self.create_publisher(PoseStamped, "/slam_pose", 10)
-        map_qos = QoSProfile(depth=1)
-        self.map_pub = self.create_publisher(OccupancyGrid, "/map", map_qos)
+        self.map_pub = self.create_publisher(OccupancyGrid, "/map", latched)
+        self.path_pub = self.create_publisher(Path, "/slam_path", latched)
         self.tf = TransformBroadcaster(self)
         self.create_timer(
-            float(self.get_parameter("map_publish_period").value), self.publish_map
-        )
+            float(self.get_parameter("map_publish_period").value),
+            self.publish_map)
 
     def on_odom(self, msg: Odometry):
         p = msg.pose.pose
         self._odom = (p.position.x, p.position.y, _yaw_from_quat(p.orientation))
 
     def on_scan(self, msg: LaserScan):
+        try:
+            self._step(msg)
+        except Exception as e:
+            self.get_logger().error(f"step failed: {e}",
+                                    throttle_duration_sec=2.0)
+
+    def _step(self, msg: LaserScan):
         if self._odom is None:
             self.get_logger().warning("no odom yet", throttle_duration_sec=2.0)
             return
@@ -87,8 +102,8 @@ class SlamNode(Node):
             self.get_logger().info(f"configured {n} beams")
 
         r = np.nan_to_num(
-            np.asarray(msg.ranges, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
-        )
+            np.asarray(msg.ranges, dtype=np.float32),
+            nan=0.0, posinf=0.0, neginf=0.0)
         if self.max_range > 0.0:
             r[r > self.max_range] = 0.0
 
@@ -111,15 +126,27 @@ class SlamNode(Node):
         c, s = math.cos(lth), math.sin(lth)
         bx, by = c * dxw + s * dyw, -s * dxw + c * dyw
         dth = _wrap(odom[2] - lth)
+        self._last_odom = odom
+        if math.hypot(bx, by) > 1.0 or abs(dth) > 1.5:
+            self.get_logger().warning(
+                f"odom jump ({bx:.2f}, {by:.2f}, {dth:.2f}), holding velocity",
+                throttle_duration_sec=1.0)
+            bx, by, dth = self._last_body
+        else:
+            self._last_body = (bx, by, dth)
+
         yaw = float(self.bridge.pose[2])
         cy, sy = math.cos(yaw), math.sin(yaw)
-        delta = np.array([cy * bx - sy * by, sy * bx + cy * by, dth], dtype=np.float32)
-        self._last_odom = odom
+        delta = np.array([cy * bx - sy * by, sy * bx + cy * by, dth],
+                         dtype=np.float32)
 
         frac = 0.0
-        if self.deskew and msg.time_increment > 0.0:
-            frac = msg.time_increment * (n - 1) / self._scan_period
-            frac = min(max(frac, 0.0), 1.0)
+        if self.deskew:
+            sweep = abs(msg.time_increment) * (n - 1)
+            if sweep == 0.0:
+                sweep = abs(msg.angle_increment) * (n - 1) / (2.0 * math.pi) \
+                    * self._scan_period
+            frac = min(max(sweep / self._scan_period, 0.0), 1.0)
 
         t0 = time.perf_counter()
         self.bridge.step(r, delta, deskew_frac=frac)
@@ -130,8 +157,7 @@ class SlamNode(Node):
         if self._t_n == 400:
             self.get_logger().info(
                 f"step avg {self._t_acc / self._t_n * 1e3:.2f} ms "
-                f"max {self._t_max * 1e3:.2f} ms"
-            )
+                f"max {self._t_max * 1e3:.2f} ms")
             self._t_acc = self._t_max = 0.0
             self._t_n = 0
 
@@ -150,42 +176,59 @@ class SlamNode(Node):
         ps.pose.orientation.w = math.cos(th * 0.5)
         self.pose_pub.publish(ps)
 
+        if (not self._path
+                or math.hypot(x - self._path[-1].pose.position.x,
+                              y - self._path[-1].pose.position.y)
+                >= self.path_step):
+            self._path.append(ps)
+            if len(self._path) > 2000:
+                del self._path[:200]
+                self._path_published = 0
+
         ox, oy, oth = self._last_odom if self._last_odom else (0.0, 0.0, 0.0)
         dth = _wrap(th - oth)
         c, s = math.cos(dth), math.sin(dth)
-        tx = x - (c * ox - s * oy)
-        ty = y - (s * ox + c * oy)
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = self.map_frame
         t.child_frame_id = self.odom_frame
-        t.transform.translation.x = tx
-        t.transform.translation.y = ty
+        t.transform.translation.x = x - (c * ox - s * oy)
+        t.transform.translation.y = y - (s * ox + c * oy)
         t.transform.rotation.z = math.sin(dth * 0.5)
         t.transform.rotation.w = math.cos(dth * 0.5)
         self.tf.sendTransform(t)
 
     def publish_map(self):
+        now = self.get_clock().now().to_msg()
+        if len(self._path) != self._path_published:
+            self._path_published = len(self._path)
+            path = Path()
+            path.header.stamp = now
+            path.header.frame_id = self.map_frame
+            path.poses = self._path
+            self.path_pub.publish(path)
+
         if self.bridge.integrations == self._published_integrations:
             return
+        snap = self.bridge.snapshot()
+        if snap is None:
+            return
         self._published_integrations = self.bridge.integrations
-
-        occ = self.bridge.occupancy()
-        grid = int(slam.GRID)
+        crop, x0, y0 = snap
         res = float(slam.RES)
-        origin = float(slam.ORIGIN)
+        origin = float(slam.ORIGIN) - 0.5 * res
 
         m = OccupancyGrid()
-        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.stamp = now
         m.header.frame_id = self.map_frame
-        m.info.map_load_time = m.header.stamp
+        m.info.map_load_time = now
         m.info.resolution = res
-        m.info.width = grid
-        m.info.height = grid
-        m.info.origin.position.x = origin - 0.5 * res
-        m.info.origin.position.y = origin - 0.5 * res
+        m.info.width = crop.shape[1]
+        m.info.height = crop.shape[0]
+        m.info.origin.position.x = origin + x0 * res
+        m.info.origin.position.y = origin + y0 * res
         m.info.origin.orientation.w = 1.0
-        m.data = array("b", occ.tobytes())
+        m.data = array("b", np.ascontiguousarray(crop).tobytes())
         self.map_pub.publish(m)
 
 
