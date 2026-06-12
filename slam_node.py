@@ -223,7 +223,7 @@ class SlamNode(Node):
             return
         self._published_integrations = self.bridge.integrations
         crop, x0, y0 = snap
-        res = float(slam.RES)
+        res = float(slam.RESOLUTION)
         origin = float(slam.ORIGIN) - 0.5 * res
 
         m = OccupancyGrid()
