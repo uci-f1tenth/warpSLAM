@@ -15,8 +15,9 @@ import slam
 
 
 def _yaw_from_quat(q):
-    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
-                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    )
 
 
 def _wrap(a):
@@ -65,11 +66,11 @@ class SlamNode(Node):
         sensor_qos = QoSProfile(depth=1)
         sensor_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         self.create_subscription(
-            LaserScan, self.get_parameter("scan_topic").value,
-            self.on_scan, sensor_qos)
+            LaserScan, self.get_parameter("scan_topic").value, self.on_scan, sensor_qos
+        )
         self.create_subscription(
-            Odometry, self.get_parameter("odom_topic").value,
-            self.on_odom, 20)
+            Odometry, self.get_parameter("odom_topic").value, self.on_odom, 20
+        )
 
         latched = QoSProfile(depth=1)
         latched.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
@@ -78,8 +79,8 @@ class SlamNode(Node):
         self.path_pub = self.create_publisher(Path, "/slam_path", latched)
         self.tf = TransformBroadcaster(self)
         self.create_timer(
-            float(self.get_parameter("map_publish_period").value),
-            self.publish_map)
+            float(self.get_parameter("map_publish_period").value), self.publish_map
+        )
 
     def on_odom(self, msg: Odometry):
         p = msg.pose.pose
@@ -89,8 +90,7 @@ class SlamNode(Node):
         try:
             self._step(msg)
         except Exception as e:
-            self.get_logger().error(f"step failed: {e}",
-                                    throttle_duration_sec=2.0)
+            self.get_logger().error(f"step failed: {e}", throttle_duration_sec=2.0)
 
     def _step(self, msg: LaserScan):
         if self._odom is None:
@@ -102,8 +102,8 @@ class SlamNode(Node):
             self.get_logger().info(f"configured {n} beams")
 
         r = np.nan_to_num(
-            np.asarray(msg.ranges, dtype=np.float32),
-            nan=0.0, posinf=0.0, neginf=0.0)
+            np.asarray(msg.ranges, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
         if self.max_range > 0.0:
             r[r > self.max_range] = 0.0
 
@@ -130,22 +130,26 @@ class SlamNode(Node):
         if math.hypot(bx, by) > 1.0 or abs(dth) > 1.5:
             self.get_logger().warning(
                 f"odom jump ({bx:.2f}, {by:.2f}, {dth:.2f}), holding velocity",
-                throttle_duration_sec=1.0)
+                throttle_duration_sec=1.0,
+            )
             bx, by, dth = self._last_body
         else:
             self._last_body = (bx, by, dth)
 
         yaw = float(self.bridge.pose[2])
         cy, sy = math.cos(yaw), math.sin(yaw)
-        delta = np.array([cy * bx - sy * by, sy * bx + cy * by, dth],
-                         dtype=np.float32)
+        delta = np.array([cy * bx - sy * by, sy * bx + cy * by, dth], dtype=np.float32)
 
         frac = 0.0
         if self.deskew:
             sweep = abs(msg.time_increment) * (n - 1)
             if sweep == 0.0:
-                sweep = abs(msg.angle_increment) * (n - 1) / (2.0 * math.pi) \
+                sweep = (
+                    abs(msg.angle_increment)
+                    * (n - 1)
+                    / (2.0 * math.pi)
                     * self._scan_period
+                )
             frac = min(max(sweep / self._scan_period, 0.0), 1.0)
 
         t0 = time.perf_counter()
@@ -157,7 +161,8 @@ class SlamNode(Node):
         if self._t_n == 400:
             self.get_logger().info(
                 f"step avg {self._t_acc / self._t_n * 1e3:.2f} ms "
-                f"max {self._t_max * 1e3:.2f} ms")
+                f"max {self._t_max * 1e3:.2f} ms"
+            )
             self._t_acc = self._t_max = 0.0
             self._t_n = 0
 
@@ -176,10 +181,13 @@ class SlamNode(Node):
         ps.pose.orientation.w = math.cos(th * 0.5)
         self.pose_pub.publish(ps)
 
-        if (not self._path
-                or math.hypot(x - self._path[-1].pose.position.x,
-                              y - self._path[-1].pose.position.y)
-                >= self.path_step):
+        if (
+            not self._path
+            or math.hypot(
+                x - self._path[-1].pose.position.x, y - self._path[-1].pose.position.y
+            )
+            >= self.path_step
+        ):
             self._path.append(ps)
             if len(self._path) > 2000:
                 del self._path[:200]
